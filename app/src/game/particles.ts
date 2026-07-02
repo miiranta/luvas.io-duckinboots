@@ -75,15 +75,20 @@ export class Particles {
         this.items.length = write;
     }
 
+    /**
+     * Pixel-art rendering: each particle is a square snapped to the world
+     * pixel grid, with its alpha quantized to a few levels so the fade reads
+     * as discrete pixel steps rather than a smooth dissolve.
+     */
     draw(ctx: CanvasRenderingContext2D): void {
         if (this.items.length === 0) return;
         ctx.save();
         for (const p of this.items) {
-            ctx.globalAlpha = Math.min(1, (p.life / p.maxLife) * 1.4);
+            const a = Math.min(1, (p.life / p.maxLife) * 1.4);
+            ctx.globalAlpha = Math.ceil(a * 4) / 4;
             ctx.fillStyle = p.color;
-            ctx.beginPath();
-            ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2);
-            ctx.fill();
+            const s = Math.max(1, Math.round(p.size));
+            ctx.fillRect(Math.floor(p.pos.x - s / 2), Math.floor(p.pos.y - s / 2), s, s);
         }
         ctx.restore();
     }

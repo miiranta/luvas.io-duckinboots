@@ -171,6 +171,71 @@ export function sweepPointCollider(c: Collider, pos: Vec2, vel: Vec2): Hit | nul
         : sweepPointCircle(pos, vel, c.center, c.radius);
 }
 
+/**
+ * Swept point against a collider **inflated by `r` with rounded corners**
+ * (the Minkowski sum of the shape and a disk of radius `r`).
+ *
+ * This is how a rope point with thickness slides: on a flat face it keeps an
+ * `r` standoff, and around a corner the contact normal rotates *continuously*
+ * along the corner circle instead of flipping 90° between faces — which is
+ * what lets a chain wrap and slide over multi-wall contacts at any angle
+ * without snagging in the crease.
+ */
+export function sweepPointColliderRounded(c: Collider, pos: Vec2, vel: Vec2, r: number): Hit | null {
+    if (r <= 0) return sweepPointCollider(c, pos, vel);
+    if (c.kind === 'circle') return sweepPointCircle(pos, vel, c.center, c.radius + r);
+
+    const rect = c.rect;
+    const candidates = [
+        // Faces: the rect expanded along each axis.
+        sweepPointAabb(pos, vel, new Rect(rect.x - r, rect.y, rect.width + 2 * r, rect.height)),
+        sweepPointAabb(pos, vel, new Rect(rect.x, rect.y - r, rect.width, rect.height + 2 * r)),
+        // Corners: quarter circles of radius r.
+        sweepPointCircle(pos, vel, new Vec2(rect.x, rect.y), r),
+        sweepPointCircle(pos, vel, new Vec2(rect.right, rect.y), r),
+        sweepPointCircle(pos, vel, new Vec2(rect.x, rect.bottom), r),
+        sweepPointCircle(pos, vel, new Vec2(rect.right, rect.bottom), r),
+    ];
+    let best: Hit | null = null;
+    for (const hit of candidates) {
+        if (hit && (!best || hit.t < best.t)) best = hit;
+    }
+    return best;
+}
+
+/** Push a point out of a collider inflated by `r` (rounded), or `null`. */
+function pushPointOutOfRounded(pos: Vec2, c: Collider, r: number): Vec2 | null {
+    if (c.kind === 'circle') return pushPointOutOfCircle(pos, c.center, c.radius + r);
+    if (r <= 0) return pushPointOutOfAabb(pos, c.rect);
+
+    const rect = c.rect;
+    const inside =
+        pos.x > rect.x && pos.x < rect.right && pos.y > rect.y && pos.y < rect.bottom;
+    if (inside) {
+        // Deep inside: escape through the nearest face, plus the standoff.
+        const dl = pos.x - rect.x;
+        const dr = rect.right - pos.x;
+        const dt = pos.y - rect.y;
+        const db = rect.bottom - pos.y;
+        const m = Math.min(dl, dr, dt, db);
+        if (m === dl) return new Vec2(rect.x - r - 0.1, pos.y);
+        if (m === dr) return new Vec2(rect.right + r + 0.1, pos.y);
+        if (m === dt) return new Vec2(pos.x, rect.y - r - 0.1);
+        return new Vec2(pos.x, rect.bottom + r + 0.1);
+    }
+    // Outside the rect but within the rounded margin: push radially from the
+    // closest point on the rect.
+    const closest = new Vec2(
+        Math.min(Math.max(pos.x, rect.x), rect.right),
+        Math.min(Math.max(pos.y, rect.y), rect.bottom),
+    );
+    const d = pos.sub(closest);
+    const distSq = d.lengthSq();
+    if (distSq >= r * r) return null;
+    const n = distSq > 1e-12 ? d.scale(1 / Math.sqrt(distSq)) : Vec2.Y;
+    return closest.add(n.scale(r + 0.1));
+}
+
 // ── Continuous AABB resolution (the player's movement phase) ─────────────────
 
 /** Max slide iterations per movement step (corners a move can wrap around). */
@@ -322,14 +387,11 @@ export function depenetrateAabb(pos: Vec2, size: Vec2, colliders: readonly Colli
     return p;
 }
 
-/** Static push-out of a point against a candidate slice. */
-export function pushPointOutOf(pos: Vec2, colliders: readonly Collider[]): Vec2 {
+/** Static push-out of a point against a candidate slice (rounded by `radius`). */
+export function pushPointOutOf(pos: Vec2, colliders: readonly Collider[], radius = 0): Vec2 {
     let p = pos;
     for (const c of colliders) {
-        const pushed =
-            c.kind === 'aabb'
-                ? pushPointOutOfAabb(p, c.rect)
-                : pushPointOutOfCircle(p, c.center, c.radius);
+        const pushed = pushPointOutOfRounded(p, c, radius);
         if (pushed) p = pushed;
     }
     return p;
@@ -349,18 +411,19 @@ export function movePointSwept(
     from: Vec2,
     to: Vec2,
     colliders: readonly Collider[],
+    radius = 0,
 ): { pos: Vec2; hit: boolean } {
     const POINT_SKIN = 0.02;
     let pos = from;
     let vel = to.sub(from);
     let hit = false;
 
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
         if (vel.lengthSq() < 1e-10) break;
         let tMin = 1;
         let normal = Vec2.ZERO;
         for (const c of colliders) {
-            const h = sweepPointCollider(c, pos, vel);
+            const h = sweepPointColliderRounded(c, pos, vel, radius);
             if (h && h.t < tMin) {
                 tMin = h.t;
                 normal = h.normal;

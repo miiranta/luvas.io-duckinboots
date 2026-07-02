@@ -702,18 +702,18 @@ export class World {
         ctx.restore();
     }
 
-    /** Elliptical contact shadows for the duck and the squeezable balls. */
+    /**
+     * Contact shadows for the duck and the squeezable balls, drawn as
+     * **pixel-art ellipses**: stacked 1px rows on the world grid (the same
+     * resolution as the sprites), one flat shade, no anti-aliasing.
+     */
     private drawShadows(ctx: CanvasRenderingContext2D): void {
         ctx.save();
-        ctx.fillStyle = 'rgb(0 0 0 / 22%)';
+        ctx.fillStyle = 'rgb(20 26 8 / 30%)';
         const feet = this.player.pos.add(new Vec2(this.player.shape.x / 2, this.player.shape.y));
-        ctx.beginPath();
-        ctx.ellipse(feet.x, feet.y + 1, 11, 3.5, 0, 0, Math.PI * 2);
-        ctx.fill();
+        pixelEllipse(ctx, feet.x, feet.y + 1, 10, 3);
         for (const { center, radius } of this.squeezables.eachAlive()) {
-            ctx.beginPath();
-            ctx.ellipse(center.x, center.y + radius * 0.85, radius * 0.8, radius * 0.28, 0, 0, Math.PI * 2);
-            ctx.fill();
+            pixelEllipse(ctx, center.x, center.y + radius * 0.85, radius * 0.8, radius * 0.28);
         }
         ctx.restore();
     }
@@ -833,4 +833,20 @@ export class World {
 function playerStartOf(level: LevelData): Vec2 {
     const p = level.player_start;
     return p ? new Vec2(p.x, p.y) : PLAYER_START.clone();
+}
+
+/**
+ * Fill an ellipse as stacked 1px rows snapped to the world pixel grid — a
+ * blocky pixel-art ellipse matching the sprites' resolution.
+ */
+function pixelEllipse(ctx: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number): void {
+    const rows = Math.max(1, Math.round(ry));
+    const y0 = Math.round(cy - rows / 2);
+    for (let row = 0; row < rows; row++) {
+        // Row centre in [-1, 1] of the vertical radius.
+        const t = rows === 1 ? 0 : (row + 0.5) / rows * 2 - 1;
+        const half = Math.round(rx * Math.sqrt(Math.max(0, 1 - t * t)));
+        if (half <= 0) continue;
+        ctx.fillRect(Math.round(cx) - half, y0 + row, half * 2, 1);
+    }
 }

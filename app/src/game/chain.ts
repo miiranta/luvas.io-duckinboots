@@ -11,6 +11,16 @@ interface Joint {
     pos: Vec2;
     /** Previous position, used for Verlet inertia on slack joints. */
     oldPos: Vec2;
+    /**
+     * Recent-motion measure in [0, 1], bumped when the joint moves or is
+     * under tension and decaying otherwise. Drives the link animation: the
+     * crawling pattern only plays where the rope is actually alive.
+     */
+    heat: number;
+}
+
+function makeJoint(pos: Vec2): Joint {
+    return { pos, oldPos: pos.clone(), heat: 0 };
 }
 
 /**
@@ -37,6 +47,16 @@ const INERTIA_KEEP = 0.15;
 const CONSTRAINT_EPS_SQ = 0.0001;
 /** Midpoint-relaxation strength used to tighten frozen spans. */
 const TIGHTEN_STRENGTH = 0.35;
+/**
+ * The rope's physical half-thickness. Every point sweep and push-out inflates
+ * obstacles by this radius **with rounded corners**, so the rope keeps a
+ * standoff on flat faces and — crucially — its contact normal rotates
+ * continuously around corners: multi-wall contacts at any angle slide like a
+ * rope over a pulley instead of snagging where two faces meet.
+ */
+const ROPE_RADIUS = 1.5;
+/** Heat threshold above which a rope cell plays the crawl animation. */
+const HEAT_ANIMATE = 0.06;
 
 /**
  * A rope tethering the player to a fixed anchor, able to thread through
@@ -103,7 +123,7 @@ export class Chain {
         const joints: Joint[] = [];
         for (let i = 0; i < jointCount; i++) {
             const pos = a.lerp(b, i / (jointCount - 1));
-            joints.push({ pos, oldPos: pos.clone() });
+            joints.push(makeJoint(pos));
         }
         return { joints, fMin: 0 };
     }
@@ -238,7 +258,7 @@ export class Chain {
         shape.push(playerPt.clone());
         const points = resamplePolyline(shape, this.activeJointCount());
         this.spans.push({
-            joints: points.map((p) => ({ pos: p, oldPos: p.clone() })),
+            joints: points.map((p) => makeJoint(p)),
             fMin: 0,
         });
         this.resizeScratch();
@@ -268,6 +288,14 @@ export class Chain {
         this.dashPhase += dt * 14;
         this.frameGrid = staticGrid;
         this.frameDynamics = dynamics;
+
+        // Motion heat cools everywhere; the phases below re-heat whatever
+        // actually moves this frame.
+        const cool = Math.exp(-5 * dt);
+        for (const span of this.spans) {
+            for (const j of span.joints) j.heat *= cool;
+        }
+
         if (simulateActive) this.simulateActive(dt, staticGrid, dynamics);
         this.applyPullthrough(staticGrid, dynamics);
     }
@@ -282,6 +310,9 @@ export class Chain {
         const joints = this.active().joints;
         const n = joints.length;
         if (n < 2) return;
+
+        // Snapshot positions so motion heat can be measured after the phases.
+        const prev = joints.map((j) => j.pos);
 
         // Broad phase: one grid query over the span's bounds, then a cheap
         // per-joint filter into reusable buckets.
@@ -312,7 +343,7 @@ export class Chain {
         // 0. Re-establish the "outside all obstacles" invariant (only a fresh
         // spawn can violate it — all movement below is swept).
         for (let i = 1; i < n - 1; i++) {
-            const unstuck = pushPointOutOf(joints[i].pos, this.jointObstacles[i]);
+            const unstuck = pushPointOutOf(joints[i].pos, this.jointObstacles[i], ROPE_RADIUS);
             if (!unstuck.equals(joints[i].pos)) {
                 joints[i].pos = unstuck;
                 joints[i].oldPos = unstuck.clone();
@@ -372,6 +403,18 @@ export class Chain {
             // Under tension the rope settles crisply: drop all velocity.
             for (let i = 1; i < n - 1; i++) joints[i].oldPos = joints[i].pos;
         }
+
+        // Re-heat what moved this frame; taut (constrained) joints stay warm
+        // even when barely moving, so a stretched rope keeps animating.
+        for (let i = 0; i < n; i++) {
+            const moved = joints[i].pos.distance(prev[i]);
+            joints[i].heat = Math.max(joints[i].heat, Math.min(1, moved * 0.5));
+            if (this.wasConstrained[i]) joints[i].heat = Math.max(joints[i].heat, 0.2);
+        }
+        // Pinned endpoints inherit their neighbour's motion (they are set by
+        // the caller before the update, so their own delta reads as zero).
+        joints[0].heat = Math.max(joints[0].heat, joints[1].heat);
+        joints[n - 1].heat = Math.max(joints[n - 1].heat, joints[n - 2].heat);
     }
 
     /**
@@ -418,7 +461,8 @@ export class Chain {
      */
     private jointMove(i: number, from: Vec2, to: Vec2): { pos: Vec2; hit: boolean } {
         const origin = this.bucketOrigin[i];
-        const m = this.bucketMargin - 1;
+        // Coverage slack accounts for the rope radius inflating every shape.
+        const m = this.bucketMargin - 1 - 2 * ROPE_RADIUS;
         const covered =
             origin !== null &&
             Math.abs(from.x - origin.x) < m &&
@@ -428,7 +472,9 @@ export class Chain {
         if (!covered) this.refreshBucket(i, from, to);
 
         const obstacles = this.jointObstacles[i];
-        return obstacles.length === 0 ? { pos: to, hit: false } : movePointSwept(from, to, obstacles);
+        return obstacles.length === 0
+            ? { pos: to, hit: false }
+            : movePointSwept(from, to, obstacles, ROPE_RADIUS);
     }
 
     /** Re-gather joint `i`'s obstacle bucket around the move `from → to`. */
@@ -493,6 +539,7 @@ export class Chain {
             if (region.intersects(colliderBounds(c))) obstacles.push(c);
         }
 
+        const prev = joints.map((j) => j.pos);
         for (let iter = 0; iter < 24; iter++) {
             let maxMoveSq = 0;
             for (let i = 1; i < n - 1; i++) {
@@ -501,12 +548,17 @@ export class Chain {
                 const moved =
                     obstacles.length === 0
                         ? target
-                        : movePointSwept(joints[i].pos, target, obstacles).pos;
+                        : movePointSwept(joints[i].pos, target, obstacles, ROPE_RADIUS).pos;
                 maxMoveSq = Math.max(maxMoveSq, moved.distanceSq(joints[i].pos));
                 joints[i].pos = moved;
                 joints[i].oldPos = moved.clone();
             }
             if (Chain.spanLength(span) <= targetLen || maxMoveSq < 1e-4) break;
+        }
+        // Rope being pulled through re-heats the cells that gave way.
+        for (let i = 0; i < n; i++) {
+            const moved = joints[i].pos.distance(prev[i]);
+            joints[i].heat = Math.max(joints[i].heat, Math.min(1, moved * 0.5));
         }
         return before - Chain.spanLength(span);
     }
@@ -514,41 +566,57 @@ export class Chain {
     // ── Drawing ──────────────────────────────────────────────────────────────
 
     /**
-     * Draw every span as a clean layered rope: dark outline, coloured core,
-     * animated link dashes, thin highlight. Widths are in world pixels.
+     * Draw every span as **pixel-art rope**: the polyline is quantized onto
+     * the world-pixel grid and rendered as square cells — a dark outline pass
+     * and a 2×2 core whose shade alternates in 3-cell "links". The link
+     * pattern crawls only through cells whose motion heat is above
+     * [`HEAT_ANIMATE`], so the rope animates where it moves or is stretched
+     * and rests as a static texture everywhere else.
      */
     draw(ctx: CanvasRenderingContext2D, alpha: number): void {
         ctx.save();
         ctx.globalAlpha *= alpha;
-        ctx.lineJoin = 'round';
-        ctx.lineCap = 'round';
+        const crawl = Math.floor(this.dashPhase * 2.5);
 
         for (const span of this.spans) {
             const joints = span.joints;
             if (joints.length < 2) continue;
 
-            ctx.beginPath();
-            ctx.moveTo(joints[0].pos.x, joints[0].pos.y);
-            for (let i = 1; i < joints.length; i++) ctx.lineTo(joints[i].pos.x, joints[i].pos.y);
+            // Quantize the polyline into unique integer cells, carrying the
+            // motion heat of the joints each cell came from.
+            const cells: { x: number; y: number; heat: number }[] = [];
+            let lastX = Infinity;
+            let lastY = Infinity;
+            for (let i = 1; i < joints.length; i++) {
+                const a = joints[i - 1].pos;
+                const b = joints[i].pos;
+                const heat = Math.max(joints[i - 1].heat, joints[i].heat);
+                const steps = Math.max(1, Math.ceil(a.distance(b)));
+                for (let s = 0; s < steps; s++) {
+                    const p = a.lerp(b, s / steps);
+                    const x = Math.floor(p.x);
+                    const y = Math.floor(p.y);
+                    if (x === lastX && y === lastY) continue;
+                    lastX = x;
+                    lastY = y;
+                    cells.push({ x, y, heat });
+                }
+            }
 
-            ctx.strokeStyle = 'rgb(8 8 14 / 60%)';
-            ctx.lineWidth = 3.2;
-            ctx.stroke();
+            // Outline pass: one dark 3×3 block per cell (reads as the rope's
+            // pixel border and drop shade).
+            ctx.fillStyle = 'rgb(26 20 9 / 80%)';
+            for (const c of cells) ctx.fillRect(c.x - 1, c.y - 1, 3, 3);
 
-            ctx.strokeStyle = this.color;
-            ctx.lineWidth = 2;
-            ctx.stroke();
-
-            ctx.setLineDash([3, 2.2]);
-            ctx.lineDashOffset = -this.dashPhase;
-            ctx.strokeStyle = 'rgb(0 0 0 / 28%)';
-            ctx.lineWidth = 2;
-            ctx.stroke();
-            ctx.setLineDash([]);
-
-            ctx.strokeStyle = 'rgb(255 255 255 / 30%)';
-            ctx.lineWidth = 0.7;
-            ctx.stroke();
+            // Core pass: 2×2 blocks alternating light/dark every 3 cells to
+            // read as chain links; moving cells shift the pattern by `crawl`.
+            for (let k = 0; k < cells.length; k++) {
+                const c = cells[k];
+                const phase = c.heat > HEAT_ANIMATE ? k - crawl : k;
+                const light = ((phase % 6) + 6) % 6 < 3;
+                ctx.fillStyle = light ? this.color : '#b08a2e';
+                ctx.fillRect(c.x - 1, c.y - 1, 2, 2);
+            }
         }
 
         ctx.restore();
