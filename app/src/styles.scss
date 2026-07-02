@@ -1,0 +1,156 @@
+/* Global theme for Duck in Boots — a dark night-sky palette with gold
+   accents, shared by every screen so the whole game reads as one style. */
+
+@font-face {
+    font-family: Superwide;
+    src: url('/assets/fonts/Superwide.ttf') format('truetype');
+    font-display: swap;
+}
+
+@font-face {
+    font-family: PixelSans;
+    src: url('/assets/fonts/PixelSans.ttf') format('truetype');
+    font-display: swap;
+}
+
+:root {
+    --bg-top: #0a0e1c;
+    --bg-bottom: #131a33;
+    --panel: rgb(13 17 34 / 88%);
+    --panel-border: rgb(232 189 74 / 35%);
+    --gold: #e8bd4a;
+    --gold-bright: #ffd970;
+    --gold-dim: #7a6224;
+    --text-bright: #fff;
+    --text-normal: #b2b4c8;
+    --text-dim: #676a85;
+    --danger: #c33;
+    --success: #2f9e44;
+    --font-display: Superwide, 'Arial Black', sans-serif;
+    --font-body: PixelSans, 'Courier New', monospace;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg-top);
+    color: var(--text-normal);
+    font-family: var(--font-body);
+    user-select: none;
+}
+
+/* ── Shared UI pieces ────────────────────────────────────────────────────── */
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-top: 2px solid var(--gold);
+    border-radius: 10px;
+    box-shadow: 0 18px 50px rgb(0 0 0 / 55%);
+    backdrop-filter: blur(6px);
+    padding: 2rem 2.5rem;
+}
+
+.screen-title {
+    font-family: var(--font-display);
+    color: var(--text-bright);
+    letter-spacing: 0.08em;
+    text-shadow:
+        0 3px 0 rgb(0 0 0 / 45%),
+        0 0 32px rgb(232 189 74 / 25%);
+    margin: 0;
+}
+
+.btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.65rem;
+    width: 100%;
+    padding: 0.8rem 1.4rem;
+    font-family: var(--font-body);
+    font-size: 1.05rem;
+    letter-spacing: 0.14em;
+    color: var(--text-normal);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition:
+        background 0.15s ease,
+        color 0.15s ease,
+        border-color 0.15s ease,
+        transform 0.15s ease;
+
+    &:hover,
+    &.selected {
+        color: var(--text-bright);
+        background: rgb(232 189 74 / 10%);
+        border-color: var(--panel-border);
+        transform: translateX(3px);
+        box-shadow: inset 3px 0 0 var(--gold);
+    }
+
+    &:active {
+        transform: translateX(3px) scale(0.98);
+    }
+}
+
+[dir='rtl'] .btn {
+    &:hover,
+    &.selected {
+        transform: translateX(-3px);
+        box-shadow: inset -3px 0 0 var(--gold);
+    }
+}
+
+.hint {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+}
+
+kbd {
+    display: inline-block;
+    min-width: 2.2rem;
+    padding: 0.2rem 0.55rem;
+    text-align: center;
+    font-family: var(--font-body);
+    font-size: 0.85rem;
+    color: var(--gold-bright);
+    background: rgb(232 189 74 / 8%);
+    border: 1px solid var(--panel-border);
+    border-bottom-width: 3px;
+    border-radius: 5px;
+}
+
+/* Fullscreen overlays share the same darkened backdrop. */
+.overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    background: rgb(4 6 12 / 62%);
+    backdrop-filter: blur(3px);
+    z-index: 10;
+    animation: overlay-in 0.25s ease;
+}
+
+@keyframes overlay-in {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}

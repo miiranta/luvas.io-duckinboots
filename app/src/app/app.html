@@ -1,0 +1,27 @@
+<app-game-canvas />
+
+@switch (game.screen()) {
+    @case ('loading') {
+        <div class="loading-screen">
+            <div class="loading-duck"></div>
+            <p class="hint">{{ i18n.t('loading') }}</p>
+        </div>
+    }
+    @case ('menu') {
+        <app-main-menu />
+    }
+    @case ('playing') {
+        <app-hud />
+    }
+    @case ('paused') {
+        <app-pause-overlay />
+    }
+    @case ('win') {
+        <app-end-overlay kind="win" />
+    }
+    @case ('defeat') {
+        <app-end-overlay kind="defeat" />
+    }
+}
+
+<div class="fade" [style.opacity]="game.fadeOpacity()"></div>

@@ -1,0 +1,19 @@
+<div class="overlay" [class.win]="kind() === 'win'" [class.defeat]="kind() === 'defeat'">
+    @if (kind() === 'win') {
+        <div class="dancing-duck"></div>
+    }
+    <h2 class="screen-title title">{{ i18n.t(kind() === 'win' ? 'win' : 'defeat') }}</h2>
+    @if (kind() === 'win') {
+        <p class="score">
+            {{ i18n.t('squeezed_label') }}: {{ game.squeezed() }} / {{ game.squeezeTotal() }}
+        </p>
+    }
+    <div class="actions">
+        <button class="btn" (click)="game.play()">
+            {{ i18n.t(kind() === 'win' ? 'play_again' : 'retry') }} <kbd>ENTER</kbd>
+        </button>
+        <button class="btn" (click)="game.backToMenu()">
+            {{ i18n.t('back_to_menu') }} <kbd>M</kbd>
+        </button>
+    </div>
+</div>

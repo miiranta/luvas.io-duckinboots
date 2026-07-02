@@ -1,0 +1,226 @@
+:host {
+    position: fixed;
+    inset: 0;
+    display: block;
+    overflow: hidden;
+}
+
+/* ── Animated background ─────────────────────────────────────────────────── */
+
+.menu-bg {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(var(--bg-top), var(--bg-bottom));
+}
+
+/* A star field from layered box-shadows — no extra assets needed. */
+.stars {
+    position: absolute;
+    inset: 0;
+
+    &::before,
+    &::after {
+        content: '';
+        position: absolute;
+        width: 2px;
+        height: 2px;
+        border-radius: 50%;
+        background: transparent;
+        box-shadow:
+            4vw 6vh 0 rgb(190 198 235 / 45%),
+            12vw 22vh 0 rgb(190 198 235 / 25%),
+            18vw 4vh 0 rgb(190 198 235 / 40%),
+            26vw 14vh 0 rgb(190 198 235 / 30%),
+            33vw 7vh 0 rgb(190 198 235 / 45%),
+            41vw 18vh 0 rgb(190 198 235 / 25%),
+            48vw 3vh 0 rgb(190 198 235 / 35%),
+            55vw 11vh 0 rgb(190 198 235 / 45%),
+            63vw 24vh 0 rgb(190 198 235 / 25%),
+            70vw 8vh 0 rgb(190 198 235 / 40%),
+            78vw 16vh 0 rgb(190 198 235 / 30%),
+            85vw 5vh 0 rgb(190 198 235 / 45%),
+            92vw 20vh 0 rgb(190 198 235 / 30%),
+            8vw 78vh 0 rgb(190 198 235 / 30%),
+            21vw 88vh 0 rgb(190 198 235 / 40%),
+            37vw 82vh 0 rgb(190 198 235 / 25%),
+            52vw 91vh 0 rgb(190 198 235 / 35%),
+            68vw 80vh 0 rgb(190 198 235 / 30%),
+            83vw 87vh 0 rgb(190 198 235 / 40%),
+            95vw 76vh 0 rgb(190 198 235 / 25%);
+        animation: twinkle 4s ease-in-out infinite alternate;
+    }
+
+    &::after {
+        transform: translate(3vw, 40vh) scale(0.8);
+        animation-delay: 2s;
+    }
+}
+
+@keyframes twinkle {
+    from {
+        opacity: 0.5;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+/* Falling ducks, straight from the sprite sheet (row 1 = walk cycle). */
+.duck {
+    position: absolute;
+    top: -64px;
+    animation: duck-fall linear infinite;
+    opacity: 0.55;
+}
+
+.duck-sprite {
+    width: 32px;
+    height: 32px;
+    background: url('/assets/sprites/ducky_spritesheet.png') no-repeat;
+    background-position: 0 -32px;
+    image-rendering: pixelated;
+    animation: duck-walk 0.55s steps(6) infinite;
+}
+
+@keyframes duck-fall {
+    to {
+        transform: translateY(115vh);
+    }
+}
+
+@keyframes duck-walk {
+    to {
+        background-position: -192px -32px;
+    }
+}
+
+/* ── Foreground ──────────────────────────────────────────────────────────── */
+
+.menu-content {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.4rem;
+    padding: 2rem;
+}
+
+.game-title {
+    font-size: clamp(2.2rem, 7vw, 4.5rem);
+    text-align: center;
+    animation: title-in 0.6s ease;
+}
+
+.title-rule {
+    width: min(480px, 70vw);
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--gold), transparent);
+}
+
+@keyframes title-in {
+    from {
+        opacity: 0;
+        transform: translateY(-14px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.menu-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    width: min(420px, 90vw);
+    animation: panel-in 0.4s ease;
+}
+
+.sub-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    width: min(560px, 92vw);
+    max-height: 70vh;
+    overflow-y: auto;
+    animation: panel-in 0.4s ease;
+}
+
+@keyframes panel-in {
+    from {
+        opacity: 0;
+        transform: translateY(12px);
+    }
+
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+.sub-title {
+    font-size: 1.4rem;
+    text-align: center;
+}
+
+.controls-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+
+    li {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+
+        kbd {
+            flex-shrink: 0;
+            min-width: 8.5rem;
+        }
+    }
+}
+
+.objective {
+    margin: 0;
+    line-height: 1.5;
+    color: var(--text-normal);
+    border-inline-start: 3px solid var(--gold-dim);
+    padding-inline-start: 0.9rem;
+}
+
+.made-by {
+    text-align: center;
+    margin: 0;
+}
+
+.credits-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    text-align: center;
+    color: var(--gold-bright);
+    font-size: 1.15rem;
+    letter-spacing: 0.06em;
+}
+
+.lang-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.back-btn {
+    margin-top: 0.4rem;
+    justify-content: center;
+    color: var(--text-dim);
+}

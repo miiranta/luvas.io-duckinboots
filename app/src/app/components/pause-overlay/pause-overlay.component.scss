@@ -1,0 +1,10 @@
+.title {
+    font-size: clamp(2rem, 6vw, 3.4rem);
+}
+
+.actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: min(320px, 85vw);
+}

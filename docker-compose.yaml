@@ -1,0 +1,6 @@
+services:
+  duckinboots:
+    build: .
+    ports:
+      - '7115:7115'
+    restart: unless-stopped

@@ -1,0 +1,111 @@
+<div class="menu-bg">
+    <div class="stars"></div>
+    @for (duck of ducks; track $index) {
+        <div
+            class="duck"
+            [style.left.%]="duck.left"
+            [style.animation-delay.s]="duck.delay"
+            [style.animation-duration.s]="duck.duration"
+        >
+            <div
+                class="duck-sprite"
+                [style.transform]="
+                    'scale(' +
+                    (duck.flip ? -duck.scale : duck.scale) +
+                    ',' +
+                    duck.scale +
+                    ') rotate(' +
+                    duck.rotation +
+                    'deg)'
+                "
+            ></div>
+        </div>
+    }
+</div>
+
+<div class="menu-content">
+    <h1 class="screen-title game-title">{{ i18n.t('game_title') }}</h1>
+    <div class="title-rule"></div>
+
+    @switch (screen()) {
+        @case ('main') {
+            <nav class="panel menu-panel">
+                @for (item of items; track item.key; let i = $index) {
+                    <button
+                        class="btn"
+                        [class.selected]="selected() === i"
+                        (mouseenter)="selected.set(i)"
+                        (click)="item.action()"
+                    >
+                        {{ i18n.t(item.key) }}
+                    </button>
+                }
+            </nav>
+            <p class="hint">{{ i18n.t('menu_hint') }}</p>
+        }
+        @case ('instructions') {
+            <section class="panel sub-panel">
+                <h2 class="screen-title sub-title">{{ i18n.t('instructions_title') }}</h2>
+                <ul class="controls-list">
+                    <li>
+                        <kbd>{{ i18n.t('key_move') }}</kbd
+                        ><span>{{ i18n.t('inst_move') }}</span>
+                    </li>
+                    <li>
+                        <kbd>{{ i18n.t('key_space') }}</kbd
+                        ><span>{{ i18n.t('inst_portals') }}</span>
+                    </li>
+                    <li>
+                        <kbd>{{ i18n.t('key_wheel') }}</kbd
+                        ><span>{{ i18n.t('inst_zoom') }}</span>
+                    </li>
+                    <li>
+                        <kbd>{{ i18n.t('key_pause') }}</kbd
+                        ><span>{{ i18n.t('inst_pause') }}</span>
+                    </li>
+                </ul>
+                <p class="objective">{{ i18n.t('inst_objective') }}</p>
+                <p class="objective">{{ i18n.t('inst_box') }}</p>
+                <button class="btn back-btn" (click)="screen.set('main')">
+                    ← {{ i18n.t('back_to_menu') }}
+                </button>
+            </section>
+            <p class="hint">{{ i18n.t('back_hint') }}</p>
+        }
+        @case ('credits') {
+            <section class="panel sub-panel">
+                <h2 class="screen-title sub-title">{{ i18n.t('credits_title') }}</h2>
+                <p class="hint made-by">{{ i18n.t('made_by') }}</p>
+                <ul class="credits-list">
+                    @for (name of credits; track name) {
+                        <li>{{ name }}</li>
+                    }
+                </ul>
+                <button class="btn back-btn" (click)="screen.set('main')">
+                    ← {{ i18n.t('back_to_menu') }}
+                </button>
+            </section>
+            <p class="hint">{{ i18n.t('back_hint') }}</p>
+        }
+        @case ('language') {
+            <section class="panel sub-panel">
+                <h2 class="screen-title sub-title">{{ i18n.t('select_language') }}</h2>
+                <nav class="lang-list">
+                    @for (lang of i18n.langs; track lang.code) {
+                        <button
+                            class="btn"
+                            [class.selected]="i18n.lang() === lang.code"
+                            (click)="selectLang(lang.code)"
+                        >
+                            {{ lang.label }}
+                        </button>
+                    }
+                </nav>
+                <button class="btn back-btn" (click)="screen.set('main')">
+                    ← {{ i18n.t('back_to_menu') }}
+                </button>
+            </section>
+            <p class="hint">{{ i18n.t('back_hint') }}</p>
+        }
+    }
+</div>

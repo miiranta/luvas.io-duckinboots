@@ -1,0 +1,13 @@
+<div class="hud-top">
+    <div class="stat">
+        <span class="stat-label">{{ i18n.t('squeezed_label') }}</span>
+        <span class="stat-value">{{ game.squeezed() }} / {{ game.squeezeTotal() }}</span>
+    </div>
+    <div class="stat fps">
+        <span class="stat-label">{{ i18n.t('fps_label') }}</span>
+        <span class="stat-value">{{ game.fps() }}</span>
+    </div>
+    <button class="pause-btn" (click)="game.pause()" aria-label="Pause">Ⅱ</button>
+</div>
+
+<p class="hud-bottom hint">{{ i18n.t('hud_controls') }}</p>

@@ -1,0 +1,42 @@
+:host {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+}
+
+.fade {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+    z-index: 100;
+}
+
+.loading-screen {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.2rem;
+    background: linear-gradient(var(--bg-top), var(--bg-bottom));
+}
+
+/* The walking duck, straight from the sprite sheet (row 1 = walk cycle). */
+.loading-duck {
+    width: 32px;
+    height: 32px;
+    background: url('/assets/sprites/ducky_spritesheet.png') no-repeat;
+    background-position: 0 -32px;
+    transform: scale(3);
+    image-rendering: pixelated;
+    animation: duck-walk 0.6s steps(6) infinite;
+}
+
+@keyframes duck-walk {
+    to {
+        background-position: -192px -32px;
+    }
+}
