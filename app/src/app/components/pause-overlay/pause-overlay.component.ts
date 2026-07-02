@@ -12,7 +12,7 @@ import { I18nService } from '../../services/i18n.service';
                 <button class="btn" (click)="game.resume()">
                     {{ i18n.t('resume') }} <kbd>ESC</kbd>
                 </button>
-                <button class="btn" (click)="game.backToMenu()">
+                <button class="btn" (click)="game.quitRun()">
                     {{ i18n.t('back_to_menu') }} <kbd>M</kbd>
                 </button>
             </div>

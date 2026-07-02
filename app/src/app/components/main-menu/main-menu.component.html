@@ -44,6 +44,57 @@
             </nav>
             <p class="hint">{{ i18n.t('menu_hint') }}</p>
         }
+        @case ('levels') {
+            <section class="panel sub-panel">
+                <h2 class="screen-title sub-title">{{ i18n.t('levels_title') }}</h2>
+                @if (levels(); as list) {
+                    <ul class="level-list">
+                        @for (level of list; track level.id) {
+                            <li class="level-row" (click)="playLevel(level.id)">
+                                <div class="level-info">
+                                    <span class="level-name">
+                                        {{ level.name }}
+                                        @if (level.builtin) {
+                                            <span class="builtin-badge">{{
+                                                i18n.t('level_builtin')
+                                            }}</span>
+                                        }
+                                    </span>
+                                    <span class="level-meta">
+                                        {{ level.colliderCount }} · {{ level.assetCount }} 🖼
+                                    </span>
+                                </div>
+                                <button
+                                    class="row-btn"
+                                    (click)="editLevel(level.id); $event.stopPropagation()"
+                                    [title]="i18n.t('level_edit')"
+                                >
+                                    ✎
+                                </button>
+                                @if (!level.builtin) {
+                                    <button
+                                        class="row-btn danger"
+                                        (click)="deleteLevel(level.id, $event)"
+                                        [title]="i18n.t('level_delete')"
+                                    >
+                                        ✕
+                                    </button>
+                                }
+                                <button class="row-btn play" [title]="i18n.t('play')">▶</button>
+                            </li>
+                        } @empty {
+                            <p class="hint">{{ i18n.t('levels_empty') }}</p>
+                        }
+                    </ul>
+                } @else {
+                    <p class="hint">{{ i18n.t('loading') }}</p>
+                }
+                <button class="btn back-btn" (click)="screen.set('main')">
+                    ← {{ i18n.t('back_to_menu') }}
+                </button>
+            </section>
+            <p class="hint">{{ i18n.t('back_hint') }}</p>
+        }
         @case ('instructions') {
             <section class="panel sub-panel">
                 <h2 class="screen-title sub-title">{{ i18n.t('instructions_title') }}</h2>

@@ -3,6 +3,7 @@ import { GameService } from './services/game.service';
 import { I18nService } from './services/i18n.service';
 import { GameCanvasComponent } from './components/game-canvas/game-canvas.component';
 import { MainMenuComponent } from './components/main-menu/main-menu.component';
+import { LevelEditorComponent } from './components/level-editor/level-editor.component';
 import { HudComponent } from './components/hud/hud.component';
 import { PauseOverlayComponent } from './components/pause-overlay/pause-overlay.component';
 import { EndOverlayComponent } from './components/end-overlay/end-overlay.component';
@@ -12,6 +13,7 @@ import { EndOverlayComponent } from './components/end-overlay/end-overlay.compon
     imports: [
         GameCanvasComponent,
         MainMenuComponent,
+        LevelEditorComponent,
         HudComponent,
         PauseOverlayComponent,
         EndOverlayComponent,

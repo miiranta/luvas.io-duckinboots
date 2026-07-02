@@ -1,7 +1,8 @@
 import { Camera2D } from '../engine/camera';
 import { Input } from '../engine/input';
 import { Circle, Rect, Vec2, clamp } from '../engine/math';
-import { LevelData, getTag, isRect, shapeId } from '../engine/level';
+import { LevelDocument, TAG_COLORS, chainAnchor, playerStart } from '../engine/level';
+import { GameTexture } from '../engine/textures';
 import { SpriteSheet } from '../engine/sprite-sheet';
 import {
     Collider,
@@ -16,8 +17,6 @@ import {
 import {
     MovableBox,
     barCollidersFrom,
-    bindCollisionsToAssets,
-    isMovableTag,
     movableBoxesFrom,
     spawnItemSqueezables,
     staticCollidersFrom,
@@ -28,10 +27,6 @@ import { Particles } from './particles';
 import { Portals } from './portals';
 import { Squeezables } from './squeezables';
 
-/** Where the chains are anchored, in world coordinates. */
-const CHAIN_ANCHOR = new Vec2(992, 128);
-/** Fallback player spawn when the level doesn't author one. */
-const PLAYER_START = new Vec2(0, 0);
 /** Seconds of player stillness before the chains are allowed to freeze. */
 const PLAYER_STILL_THRESHOLD = 0.01;
 /** Max joint displacement (px/frame) considered "totally still". */
@@ -50,12 +45,11 @@ export interface WorldAssets {
     ducky: SpriteSheet;
     portalPurple: SpriteSheet;
     portalGreen: SpriteSheet;
-    level: LevelData;
-    textures: Map<string, HTMLImageElement>;
+    level: LevelDocument;
+    /** Decoded level textures keyed by asset id. */
+    textures: Map<string, GameTexture>;
 }
 
-/** Total rope length of the chain tethering the player to the anchor. */
-const CHAIN_LENGTH = 1600;
 /** Physics link spacing of the chain (also its visual granularity). */
 const CHAIN_LINK_SIZE = 4;
 /** The chain's rope colour (theme gold). */
@@ -131,8 +125,9 @@ function pullNormal(p: Rect, b: Rect, disp: Vec2, reach: number): Vec2 | null {
  */
 export class World {
     readonly player: Player;
-    private readonly level: LevelData;
-    private readonly textures: Map<string, HTMLImageElement>;
+    private readonly level: LevelDocument;
+    private readonly textures: Map<string, GameTexture>;
+    private readonly anchor: Vec2;
 
     private readonly staticColliders: Collider[];
     private readonly barColliders: Collider[];
@@ -157,7 +152,11 @@ export class World {
     private dustTimer = 0;
 
     zoom = 3;
+    /** Where the wheel wants the zoom to be; `zoom` eases toward it. */
+    private targetZoom = 3;
     debugCollisions = false;
+    /** World clock (seconds), drives animated textures and water. */
+    private time = 0;
 
     // Reusable per-frame collider buffers.
     private colliders: Collider[] = [];
@@ -175,15 +174,14 @@ export class World {
     constructor(private readonly assets: WorldAssets) {
         this.level = assets.level;
         this.textures = assets.textures;
+        this.anchor = chainAnchor(this.level);
 
-        // Resolve the designer's missing tag/ID wiring, then derive colliders.
-        bindCollisionsToAssets(this.level, this.textures);
         this.staticColliders = staticCollidersFrom(this.level);
         this.staticGrid = new ColliderGrid(this.staticColliders);
         this.barColliders = barCollidersFrom(this.level);
         this.immovableColliders = [...this.staticColliders, ...this.barColliders];
         this.boxes = movableBoxesFrom(this.level, snapToGrid);
-        this.playerStartPos = playerStartOf(this.level);
+        this.playerStartPos = playerStart(this.level);
 
         this.player = new Player(assets.ducky);
         this.player.pos = this.playerStartPos.clone();
@@ -202,7 +200,9 @@ export class World {
     /** Build the chain tethering the player to the anchor. */
     private newChains(): Chain[] {
         const start = this.player.pos.add(this.player.chainOffset);
-        return [new Chain(CHAIN_ANCHOR, start, CHAIN_LENGTH, CHAIN_LINK_SIZE, CHAIN_COLOR)];
+        return [
+            new Chain(this.anchor, start, this.level.chainLength, CHAIN_LINK_SIZE, CHAIN_COLOR),
+        ];
     }
 
     /** True when every squeezable has been crushed (the win condition). */
@@ -221,6 +221,7 @@ export class World {
         this.crossingGuard = null;
         this.guardDwell = 0;
         this.zoom = 3;
+        this.targetZoom = 3;
         this.squeezables.reviveAll();
         this.squeezeCount = 0;
         this.prevPlayerPos = this.player.pos.clone();
@@ -233,7 +234,13 @@ export class World {
     /** Advance the world one fixed step. Pausing simply stops calling this. */
     update(input: Input, dt: number): void {
         if (input.wasPressed('F3')) this.debugCollisions = !this.debugCollisions;
-        this.zoom = clamp(this.zoom + input.wheelMove() * 0.1, 0.5, 6);
+        this.time += dt;
+
+        // Smooth zoom: the wheel moves a *target* (multiplicatively, so a
+        // notch feels the same at every zoom level) and the camera eases
+        // toward it exponentially, frame-rate independent.
+        this.targetZoom = clamp(this.targetZoom * Math.pow(1.12, input.wheelMove()), 0.5, 6);
+        this.zoom += (this.targetZoom - this.zoom) * (1 - Math.exp(-12 * dt));
 
         // Track how long the player has been still.
         if (this.player.pos.distanceSq(this.prevPlayerPos) > 1e-4) {
@@ -479,10 +486,9 @@ export class World {
         const box = this.boxes[i];
         box.rect.x += delta.x;
         box.rect.y += delta.y;
-        const instances = this.level.sprite_instances ?? [];
         for (const { index, offset } of box.sprites) {
-            instances[index].x = box.rect.x + offset.x;
-            instances[index].y = box.rect.y + offset.y;
+            this.level.sprites[index].x = box.rect.x + offset.x;
+            this.level.sprites[index].y = box.rect.y + offset.y;
         }
     }
 
@@ -570,7 +576,7 @@ export class World {
         this.squeezables.extendColliders(this.dynamicColliders);
 
         for (const chain of this.chains) {
-            chain.setStart(CHAIN_ANCHOR);
+            chain.setStart(this.anchor);
             chain.setEnd(end);
             // When everything is still, skip the active-span simulation (the
             // pull-through tightening still runs — it's demand-driven).
@@ -679,15 +685,16 @@ export class World {
             height / scale,
         ).grow(64);
 
-        // Floor decals first (chains, anchor, portals): the rope lies on the
-        // ground, so tall Y-sorted sprites and the player draw *over* it.
-        // Drawing chains above everything (as the original did) made a rope
-        // passing "behind" a statue look like it clipped through it.
+        // Floor first: flat level geometry (walls/water/bars render as tinted
+        // slabs — levels need no artwork to be playable), then background
+        // sprites, then the floor decals (chains, anchor, portals): the rope
+        // lies on the ground, so Y-sorted entities draw *over* it.
+        this.drawGeometry(ctx, view);
         this.drawBackgroundSprites(ctx, view);
         for (const chain of this.chains) chain.draw(ctx, 1);
         ctx.fillStyle = '#ffcb00';
         ctx.beginPath();
-        ctx.arc(CHAIN_ANCHOR.x, CHAIN_ANCHOR.y, 6, 0, Math.PI * 2);
+        ctx.arc(this.anchor.x, this.anchor.y, 6, 0, Math.PI * 2);
         ctx.fill();
         this.portals.draw(ctx);
 
@@ -718,45 +725,136 @@ export class World {
         ctx.restore();
     }
 
+    /**
+     * Flat rendering of the level geometry, so a level is fully playable
+     * with zero imported artwork. Water shimmers on the world clock; walls
+     * get a subtle top-edge highlight; movable boxes render at their *live*
+     * physics rects with a crate look.
+     */
+    private drawGeometry(ctx: CanvasRenderingContext2D, view: Rect): void {
+        for (const { tag, shape } of this.level.colliders) {
+            if (tag === 'movable' || tag === 'item') continue; // live entities
+            const bounds =
+                shape.kind === 'rect'
+                    ? new Rect(shape.x, shape.y, shape.w, shape.h)
+                    : new Rect(shape.x - shape.r, shape.y - shape.r, shape.r * 2, shape.r * 2);
+            if (!bounds.intersects(view)) continue;
+
+            const base = TAG_COLORS[tag];
+            if (shape.kind === 'circle') {
+                ctx.fillStyle = base;
+                ctx.beginPath();
+                ctx.arc(shape.x, shape.y, shape.r, 0, Math.PI * 2);
+                ctx.fill();
+                continue;
+            }
+
+            if (tag === 'water') {
+                // Two-tone shimmer: base fill plus drifting lighter bands.
+                ctx.fillStyle = '#1d5f9e';
+                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(shape.x, shape.y, shape.w, shape.h);
+                ctx.clip();
+                ctx.fillStyle = 'rgb(120 190 255 / 25%)';
+                const phase = (this.time * 14) % 48;
+                for (let y = shape.y - 48 + phase; y < shape.y + shape.h; y += 48) {
+                    ctx.fillRect(shape.x, y, shape.w, 6);
+                }
+                ctx.restore();
+            } else if (tag === 'bar') {
+                // Bars read as railings: posts under a solid top rail.
+                ctx.fillStyle = 'rgb(255 138 42 / 30%)';
+                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
+                ctx.fillStyle = base;
+                if (shape.w >= shape.h) {
+                    ctx.fillRect(shape.x, shape.y, shape.w, 4);
+                    for (let x = shape.x + 4; x < shape.x + shape.w - 4; x += 16) {
+                        ctx.fillRect(x, shape.y, 4, shape.h);
+                    }
+                } else {
+                    ctx.fillRect(shape.x, shape.y, 4, shape.h);
+                    for (let y = shape.y + 4; y < shape.y + shape.h - 4; y += 16) {
+                        ctx.fillRect(shape.x, y, shape.w, 4);
+                    }
+                }
+            } else {
+                // Walls: dark slab, lighter lid, faint inner border.
+                ctx.fillStyle = '#2a3040';
+                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
+                ctx.fillStyle = base;
+                ctx.fillRect(shape.x, shape.y, shape.w, Math.min(6, shape.h));
+                ctx.strokeStyle = 'rgb(255 255 255 / 6%)';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(shape.x + 1, shape.y + 1, shape.w - 2, shape.h - 2);
+            }
+        }
+    }
+
+    /** Crate look for a movable box without linked artwork. */
+    private drawBoxFlat(ctx: CanvasRenderingContext2D, r: Rect): void {
+        ctx.fillStyle = '#8a6a2f';
+        ctx.fillRect(r.x, r.y, r.width, r.height);
+        ctx.fillStyle = '#e8bd4a';
+        ctx.fillRect(r.x + 3, r.y + 3, r.width - 6, r.height - 6);
+        ctx.strokeStyle = '#8a6a2f';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(r.x, r.y);
+        ctx.lineTo(r.right, r.bottom);
+        ctx.moveTo(r.right, r.y);
+        ctx.lineTo(r.x, r.bottom);
+        ctx.stroke();
+    }
+
     private spriteVisible(i: number, view: Rect): boolean {
-        const inst = (this.level.sprite_instances ?? [])[i];
-        const tex = this.textures.get(inst.path);
+        const sprite = this.level.sprites[i];
+        const tex = this.textures.get(sprite.assetId);
         if (!tex) return false;
         return (
-            inst.x < view.right &&
-            inst.x + tex.naturalWidth * inst.scale > view.x &&
-            inst.y < view.bottom &&
-            inst.y + tex.naturalHeight * inst.scale > view.y
+            sprite.x < view.right &&
+            sprite.x + tex.width * sprite.scale > view.x &&
+            sprite.y < view.bottom &&
+            sprite.y + tex.height * sprite.scale > view.y
         );
     }
 
-    /** The flat ground layer: background-flagged sprites, under everything. */
+    /** The flat ground layer: background-layer sprites, under everything. */
     private drawBackgroundSprites(ctx: CanvasRenderingContext2D, view: Rect): void {
-        const instances = this.level.sprite_instances ?? [];
-        for (let i = 0; i < instances.length; i++) {
-            if (instances[i].background && this.spriteVisible(i, view)) this.drawSprite(ctx, i);
+        const sprites = this.level.sprites;
+        for (let i = 0; i < sprites.length; i++) {
+            if (sprites[i].layer === 'background' && this.spriteVisible(i, view)) {
+                this.drawSprite(ctx, i);
+            }
         }
     }
 
     /**
      * Entities with depth ordering: a Y-sort (by bottom edge, "feet") of the
-     * player, the squeezable balls, and every sprite at least as large as the
-     * player; smaller props draw last on top.
+     * player, the squeezable balls, movable boxes, and every entity-layer
+     * sprite at least as large as the player; smaller props draw last on top.
      */
     private drawYSorted(ctx: CanvasRenderingContext2D, view: Rect): void {
-        const instances = this.level.sprite_instances ?? [];
+        const sprites = this.level.sprites;
         const playerMin = this.player.spriteMinDim();
 
         const order: { y: number; draw: () => void }[] = [];
         const small: number[] = [];
-        for (let i = 0; i < instances.length; i++) {
-            const inst = instances[i];
-            if (inst.background || !this.spriteVisible(i, view)) continue;
-            const tex = this.textures.get(inst.path);
-            const w = tex ? tex.naturalWidth * inst.scale : 0;
-            const h = tex ? tex.naturalHeight * inst.scale : 0;
+        for (let i = 0; i < sprites.length; i++) {
+            const sprite = sprites[i];
+            if (sprite.layer === 'background' || !this.spriteVisible(i, view)) continue;
+            const tex = this.textures.get(sprite.assetId);
+            const w = tex ? tex.width * sprite.scale : 0;
+            const h = tex ? tex.height * sprite.scale : 0;
             if (Math.min(w, h) < playerMin) small.push(i);
-            else order.push({ y: inst.y + h, draw: () => this.drawSprite(ctx, i) });
+            else order.push({ y: sprite.y + h, draw: () => this.drawSprite(ctx, i) });
+        }
+        for (const b of this.boxes) {
+            // Boxes with linked artwork are drawn by their sprites instead.
+            if (b.sprites.length === 0 && b.rect.intersects(view)) {
+                order.push({ y: b.rect.bottom, draw: () => this.drawBoxFlat(ctx, b.rect) });
+            }
         }
         order.push({
             y: this.player.pos.y + this.player.shape.y,
@@ -775,39 +873,36 @@ export class World {
     }
 
     /**
-     * Draw a sprite with its destination rect **snapped to whole device
-     * pixels**. Adjacent tiles authored flush share the same world edge, so
-     * after rounding they share the same device edge — this is what removes
-     * the black seam lines that fractional scaling otherwise leaves between
-     * tiles (each tile's edges rounding differently exposes the background).
+     * Draw a sprite (its current animation frame) with its destination rect
+     * **snapped to whole device pixels**. Adjacent tiles authored flush share
+     * the same world edge, so after rounding they share the same device edge —
+     * this removes the seam lines fractional scaling otherwise leaves.
      */
     private drawSprite(ctx: CanvasRenderingContext2D, i: number): void {
-        const inst = (this.level.sprite_instances ?? [])[i];
-        const tex = this.textures.get(inst.path);
+        const sprite = this.level.sprites[i];
+        const tex = this.textures.get(sprite.assetId);
         if (!tex) return;
         const s = this.frameScale;
-        const x0 = Math.round(inst.x * s + this.frameTx);
-        const y0 = Math.round(inst.y * s + this.frameTy);
-        const x1 = Math.round((inst.x + tex.naturalWidth * inst.scale) * s + this.frameTx);
-        const y1 = Math.round((inst.y + tex.naturalHeight * inst.scale) * s + this.frameTy);
+        const x0 = Math.round(sprite.x * s + this.frameTx);
+        const y0 = Math.round(sprite.y * s + this.frameTy);
+        const x1 = Math.round((sprite.x + tex.width * sprite.scale) * s + this.frameTx);
+        const y1 = Math.round((sprite.y + tex.height * sprite.scale) * s + this.frameTy);
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.drawImage(tex, x0, y0, x1 - x0, y1 - y0);
+        ctx.drawImage(tex.frameAt(this.time * 1000), x0, y0, x1 - x0, y1 - y0);
         ctx.restore();
     }
 
     /** Debug overlay: collision shapes, movable boxes, player collider. */
     private drawDebug(ctx: CanvasRenderingContext2D): void {
-        for (const shape of this.level.collision_shapes ?? []) {
-            if (isMovableTag(getTag(this.level, shapeId(shape)))) continue;
+        for (const { tag, shape } of this.level.colliders) {
+            if (tag === 'movable') continue;
             ctx.fillStyle = 'rgba(200 60 60 / 40%)';
-            if (isRect(shape)) {
-                const r = shape.Rect;
-                ctx.fillRect(r.x, r.y, r.width, r.height);
+            if (shape.kind === 'rect') {
+                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
             } else {
-                const c = shape.Circle;
                 ctx.beginPath();
-                ctx.arc(c.x, c.y, c.radius, 0, Math.PI * 2);
+                ctx.arc(shape.x, shape.y, shape.r, 0, Math.PI * 2);
                 ctx.fill();
             }
         }
@@ -828,11 +923,6 @@ export class World {
         ctx.fillStyle = 'rgba(0 228 48 / 40%)';
         ctx.fillRect(r.x, r.y, r.width, r.height);
     }
-}
-
-function playerStartOf(level: LevelData): Vec2 {
-    const p = level.player_start;
-    return p ? new Vec2(p.x, p.y) : PLAYER_START.clone();
 }
 
 /**

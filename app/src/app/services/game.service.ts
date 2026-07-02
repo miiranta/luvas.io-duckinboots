@@ -1,26 +1,40 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { GameLoop } from '../../engine/loop';
 import { Input } from '../../engine/input';
-import { loadImage, loadImageMap, loadJson } from '../../engine/assets';
-import { LevelData } from '../../engine/level';
+import { loadImage } from '../../engine/assets';
+import { LevelDocument, cloneLevel } from '../../engine/level';
+import { decodeAssets } from '../../engine/textures';
 import { PostProcessor } from '../../engine/post-processor';
 import { SpriteSheet } from '../../engine/sprite-sheet';
 import { World } from '../../game/world';
 
 /** The screen the game shell is currently on. Menus/overlays are Angular. */
-export type Screen = 'loading' | 'menu' | 'playing' | 'paused' | 'win' | 'defeat';
+export type Screen = 'loading' | 'menu' | 'editor' | 'playing' | 'paused' | 'win' | 'defeat';
 
 /** Seconds each half of the fade-to-black screen transition takes. */
 const FADE_SECONDS = 0.3;
 
+/** Core sprites shared by every level, loaded once at boot. */
+interface CoreAssets {
+    ducky: SpriteSheet;
+    portalPurple: SpriteSheet;
+    portalGreen: SpriteSheet;
+}
+
 /**
  * Owns the engine loop, the input, the world simulation, and the high-level
  * screen state. Angular components read the signals and call the intents
- * (`play`, `pause`, `resume`, …); the world stays a plain TS simulation.
+ * (`playLevel`, `pause`, `resume`, …); the world stays a plain TS simulation.
+ *
+ * Worlds are built per level: `playLevel` decodes the level's embedded
+ * assets and spins up a fresh `World`, so any level — built-in, saved in
+ * IndexedDB, or straight from the editor — plays through the same path.
  */
 @Injectable({ providedIn: 'root' })
 export class GameService {
     readonly screen = signal<Screen>('loading');
+    /** The level handed to the editor (null = start from a blank level). */
+    readonly editorLevel = signal<LevelDocument | null>(null);
     readonly fadeOpacity = signal(0);
     readonly squeezed = signal(0);
     readonly squeezeTotal = signal(0);
@@ -35,6 +49,7 @@ export class GameService {
     );
     private readonly inWorld = signal(false);
 
+    private core?: CoreAssets;
     private world?: World;
     private loop?: GameLoop;
     private readonly input = new Input();
@@ -43,8 +58,10 @@ export class GameService {
     private post: PostProcessor | null = null;
     private elapsed = 0;
     private transitioning = false;
+    /** Where leaving the pause/end screens returns to (menu or editor). */
+    private returnTo: 'menu' | 'editor' = 'menu';
 
-    /** Load all assets and start the loop. Called once by the canvas component. */
+    /** Load core assets and start the loop. Called once by the canvas component. */
     async init(canvas: HTMLCanvasElement, effectCanvas?: HTMLCanvasElement): Promise<void> {
         if (this.loop) return;
         this.canvas = canvas;
@@ -54,26 +71,16 @@ export class GameService {
             this.shadersSupported.set(this.post !== null);
         }
 
-        const [duckyImg, purpleImg, greenImg, level] = await Promise.all([
+        const [duckyImg, purpleImg, greenImg] = await Promise.all([
             loadImage('assets/sprites/ducky_spritesheet.png'),
             loadImage('assets/sprites/portal_purple.png'),
             loadImage('assets/sprites/portal_green.png'),
-            loadJson<LevelData>('assets/level.json'),
         ]);
-        const paths = (level.sprite_instances ?? []).map((i) => `assets/${i.path}`);
-        const textureFiles = await loadImageMap(paths);
-        // The level references paths as `sprites/...`; re-key without the prefix.
-        const textures = new Map<string, HTMLImageElement>();
-        for (const [key, img] of textureFiles) textures.set(key.replace(/^assets\//, ''), img);
-
-        this.world = new World({
+        this.core = {
             ducky: new SpriteSheet(duckyImg, 32, 32),
             portalPurple: new SpriteSheet(purpleImg, 64, 64),
             portalGreen: new SpriteSheet(greenImg, 64, 64),
-            level,
-            textures,
-        });
-        this.squeezeTotal.set(this.world.squeezables.totalCount);
+        };
 
         this.input.attach();
         this.loop = new GameLoop(
@@ -95,8 +102,34 @@ export class GameService {
 
     // ── Intents (called by the UI) ───────────────────────────────────────────
 
-    /** Start a fresh run from the menu or an end screen. */
-    play(): void {
+    /**
+     * Build a world for `level` and start playing it. `from` decides where
+     * quitting the run returns to (the menu, or the editor for test plays).
+     */
+    async playLevel(level: LevelDocument, from: 'menu' | 'editor' = 'menu'): Promise<void> {
+        const core = this.core;
+        if (!core || this.transitioning) return;
+        this.transitioning = true;
+        this.returnTo = from;
+        this.fadeOpacity.set(1);
+        await sleep(FADE_SECONDS * 1000);
+
+        // The world mutates sprite positions at runtime; play a copy.
+        const doc = cloneLevel(level);
+        const textures = await decodeAssets(doc.assets);
+        this.world = new World({ ...core, level: doc, textures });
+        this.squeezeTotal.set(this.world.squeezables.totalCount);
+        this.squeezed.set(0);
+
+        this.screen.set('playing');
+        this.fadeOpacity.set(0);
+        await sleep(FADE_SECONDS * 1000);
+        this.transitioning = false;
+    }
+
+    /** Restart the current run (end screens / pause). */
+    replay(): void {
+        if (!this.world) return;
         this.goTo('playing', () => this.world?.reset());
     }
 
@@ -108,8 +141,18 @@ export class GameService {
         if (this.screen() === 'paused') this.screen.set('playing');
     }
 
+    /** Leave the current run for wherever it was started from. */
+    quitRun(): void {
+        this.goTo(this.returnTo);
+    }
+
     backToMenu(): void {
         this.goTo('menu');
+    }
+
+    openEditor(level: LevelDocument | null = null): void {
+        this.editorLevel.set(level);
+        this.goTo('editor');
     }
 
     toggleFullscreen(): void {
@@ -121,10 +164,10 @@ export class GameService {
 
     private update(dt: number): void {
         const world = this.world;
-        if (!world) return;
 
         switch (this.screen()) {
             case 'playing': {
+                if (!world) break;
                 if (this.input.wasPressed('KeyP') || this.input.wasPressed('Escape')) {
                     this.pause();
                     break;
@@ -143,13 +186,13 @@ export class GameService {
             }
             case 'paused': {
                 if (this.input.wasPressed('KeyP') || this.input.wasPressed('Escape')) this.resume();
-                else if (this.input.wasPressed('KeyM')) this.backToMenu();
+                else if (this.input.wasPressed('KeyM')) this.quitRun();
                 break;
             }
             case 'win':
             case 'defeat': {
-                if (this.input.wasPressed('Enter')) this.play();
-                else if (this.input.wasPressed('KeyM')) this.backToMenu();
+                if (this.input.wasPressed('Enter')) this.replay();
+                else if (this.input.wasPressed('KeyM')) this.quitRun();
                 break;
             }
             default:
@@ -160,7 +203,7 @@ export class GameService {
 
     private render(): void {
         const { canvas, ctx, world } = this;
-        if (!canvas || !ctx || !world) return;
+        if (!canvas || !ctx) return;
 
         // Keep the backing store in sync with the displayed size.
         const dpr = window.devicePixelRatio || 1;
@@ -175,7 +218,7 @@ export class GameService {
         const inWorld =
             screen === 'playing' || screen === 'paused' || screen === 'win' || screen === 'defeat';
         this.inWorld.set(inWorld);
-        if (!inWorld) return;
+        if (!inWorld || !world) return;
 
         world.draw(ctx, w, h);
         this.elapsed += 1 / 60;
@@ -200,4 +243,8 @@ export class GameService {
             setTimeout(() => (this.transitioning = false), FADE_SECONDS * 1000);
         }, FADE_SECONDS * 1000);
     }
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,95 +1,242 @@
 import { Rect, Vec2 } from './math';
 
 /**
- * The serialized level format authored in the (Rust) map editor. The JSON is
- * loaded verbatim from `assets/level.json`; these types mirror its schema.
+ * Level format v2 — `duckinboots.level`.
+ *
+ * A level is a single self-contained JSON document: geometry, gameplay
+ * classification, embedded art assets (data URLs, so a level saved to
+ * IndexedDB or exported as a file carries its own images/GIFs), and sprite
+ * placements. Nothing is inferred at load time: colliders carry explicit
+ * gameplay tags, and sprites explicitly reference the asset and (optionally)
+ * the collider they ride on.
  */
 
+export const LEVEL_FORMAT = 'duckinboots.level';
+export const LEVEL_VERSION = 2;
+
+/** What a collider *is* in gameplay terms. */
+export type ColliderTag =
+    | 'wall' /* solid to everything */
+    | 'movable' /* pushable/pullable box */
+    | 'item' /* chain-crushable squeezable */
+    | 'bar' /* solid to the player, transparent to the chain */
+    | 'water'; /* solid; rendered as water */
+
 export interface RectShape {
-    Rect: {
-        id: string;
-        x: number;
-        y: number;
-        width: number;
-        height: number;
-        color: LevelColor;
-    };
+    kind: 'rect';
+    x: number;
+    y: number;
+    w: number;
+    h: number;
 }
 
 export interface CircleShape {
-    Circle: {
-        id: string;
-        x: number;
-        y: number;
-        radius: number;
-        color: LevelColor;
-    };
-}
-
-export type LevelShape = RectShape | CircleShape;
-
-export interface LevelColor {
+    kind: 'circle';
+    x: number;
+    y: number;
     r: number;
-    g: number;
-    b: number;
-    a: number;
 }
 
-export interface SpriteInstance {
+export type Shape = RectShape | CircleShape;
+
+export interface LevelCollider {
     id: string;
-    path: string;
+    tag: ColliderTag;
+    shape: Shape;
+}
+
+/**
+ * An embedded art asset. `data` is a data URL, so the asset travels with the
+ * level document. Animated formats (GIF, animated WebP/PNG) are decoded to
+ * frames at load time; `fps` optionally overrides the file's own timing.
+ */
+export interface LevelAsset {
+    id: string;
+    name: string;
+    mime: string;
+    data: string;
+    fps?: number;
+}
+
+/** A placed instance of an asset in the world. */
+export interface LevelSprite {
+    id: string;
+    assetId: string;
     x: number;
     y: number;
     scale: number;
-    background?: boolean;
+    /** `background` draws under everything; `entity` joins the Y-sort. */
+    layer: 'background' | 'entity';
+    /** When set, the sprite rides this (movable) collider rigidly. */
+    colliderId?: string | null;
 }
 
-export interface ClassificationEntry {
-    object_id: string;
-    tag: string;
+export interface LevelDocument {
+    format: typeof LEVEL_FORMAT;
+    version: number;
+    id: string;
+    name: string;
+    createdAt: string;
+    updatedAt: string;
+    /** Editor snap grid, world px. */
+    gridSize: number;
+    playerStart: { x: number; y: number };
+    chainAnchor: { x: number; y: number };
+    /** Total rope length of the player's chain. */
+    chainLength: number;
+    colliders: LevelCollider[];
+    assets: LevelAsset[];
+    sprites: LevelSprite[];
 }
 
-export interface LevelData {
-    sprite_shapes?: LevelShape[];
-    collision_shapes?: LevelShape[];
-    sprite_instances?: SpriteInstance[];
-    classifications?: ClassificationEntry[];
-    player_start?: { x: number; y: number } | null;
-    grid_size?: number;
+/** Editor palette + debug colours, one per tag. */
+export const TAG_COLORS: Record<ColliderTag, string> = {
+    wall: '#5a6377',
+    movable: '#e8bd4a',
+    item: '#f5008c',
+    bar: '#ff8a2a',
+    water: '#3fa3ff',
+};
+
+/** Human labels for the editor UI. */
+export const TAG_LABELS: Record<ColliderTag, string> = {
+    wall: 'Wall',
+    movable: 'Box',
+    item: 'Item',
+    bar: 'Bar',
+    water: 'Water',
+};
+
+export const ALL_TAGS: ColliderTag[] = ['wall', 'movable', 'item', 'bar', 'water'];
+
+/** Short, collision-safe id for level objects. */
+export function newId(): string {
+    return (
+        Date.now().toString(36).slice(-4) + Math.random().toString(36).slice(2, 8)
+    );
 }
 
-export function isRect(shape: LevelShape): shape is RectShape {
-    return 'Rect' in shape;
+export function createEmptyLevel(name = 'Untitled level'): LevelDocument {
+    const now = new Date().toISOString();
+    return {
+        format: LEVEL_FORMAT,
+        version: LEVEL_VERSION,
+        id: newId(),
+        name,
+        createdAt: now,
+        updatedAt: now,
+        gridSize: 32,
+        playerStart: { x: 0, y: 0 },
+        chainAnchor: { x: 0, y: -96 },
+        chainLength: 1600,
+        colliders: [],
+        assets: [],
+        sprites: [],
+    };
 }
 
-export function shapeId(shape: LevelShape): string {
-    return isRect(shape) ? shape.Rect.id : shape.Circle.id;
+export function cloneLevel(level: LevelDocument): LevelDocument {
+    return structuredClone(level);
 }
 
-export function setShapeId(shape: LevelShape, id: string): void {
-    if (isRect(shape)) shape.Rect.id = id;
-    else shape.Circle.id = id;
+/** World-space AABB of a shape. */
+export function shapeBounds(shape: Shape): Rect {
+    if (shape.kind === 'rect') return new Rect(shape.x, shape.y, shape.w, shape.h);
+    return new Rect(shape.x - shape.r, shape.y - shape.r, shape.r * 2, shape.r * 2);
 }
 
-export function shapeColor(shape: LevelShape): LevelColor {
-    return isRect(shape) ? shape.Rect.color : shape.Circle.color;
+export function playerStart(level: LevelDocument): Vec2 {
+    return new Vec2(level.playerStart.x, level.playerStart.y);
 }
 
-export function shapeBounds(shape: LevelShape): Rect {
-    if (isRect(shape)) {
-        const r = shape.Rect;
-        return new Rect(r.x, r.y, r.width, r.height);
+export function chainAnchor(level: LevelDocument): Vec2 {
+    return new Vec2(level.chainAnchor.x, level.chainAnchor.y);
+}
+
+/**
+ * Validate + repair an untrusted level document (imported JSON, old saves).
+ * Throws on documents that aren't recognizably levels; fills defaults and
+ * drops malformed entries otherwise, so a slightly-broken file still loads.
+ */
+export function normalizeLevel(raw: unknown): LevelDocument {
+    if (typeof raw !== 'object' || raw === null) throw new Error('Not a level document');
+    const doc = raw as Partial<LevelDocument> & Record<string, unknown>;
+    if (doc.format !== LEVEL_FORMAT) throw new Error('Unrecognized level format');
+
+    const num = (v: unknown, fallback: number): number =>
+        typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+    const point = (v: unknown, fx: number, fy: number): { x: number; y: number } => {
+        const p = (v ?? {}) as { x?: unknown; y?: unknown };
+        return { x: num(p.x, fx), y: num(p.y, fy) };
+    };
+
+    const colliders: LevelCollider[] = [];
+    for (const c of Array.isArray(doc.colliders) ? doc.colliders : []) {
+        const col = c as Partial<Omit<LevelCollider, 'shape'>> & { shape?: unknown };
+        const shape = col.shape as
+            | { kind?: unknown; x?: unknown; y?: unknown; w?: unknown; h?: unknown; r?: unknown }
+            | undefined;
+        if (!shape || !col.tag || !ALL_TAGS.includes(col.tag)) continue;
+        if (shape.kind === 'rect') {
+            colliders.push({
+                id: col.id || newId(),
+                tag: col.tag,
+                shape: { kind: 'rect', x: num(shape.x, 0), y: num(shape.y, 0), w: num(shape.w, 32), h: num(shape.h, 32) },
+            });
+        } else if (shape.kind === 'circle') {
+            colliders.push({
+                id: col.id || newId(),
+                tag: col.tag,
+                shape: { kind: 'circle', x: num(shape.x, 0), y: num(shape.y, 0), r: num(shape.r, 16) },
+            });
+        }
     }
-    const c = shape.Circle;
-    return new Rect(c.x - c.radius, c.y - c.radius, c.radius * 2, c.radius * 2);
-}
 
-/** Classification tag lookup: the first entry matching the object id wins. */
-export function getTag(level: LevelData, id: string): string | undefined {
-    return level.classifications?.find((e) => e.object_id === id)?.tag;
-}
+    const assets: LevelAsset[] = [];
+    for (const a of Array.isArray(doc.assets) ? doc.assets : []) {
+        const asset = a as Partial<LevelAsset>;
+        if (!asset.id || typeof asset.data !== 'string') continue;
+        assets.push({
+            id: asset.id,
+            name: asset.name || asset.id,
+            mime: asset.mime || 'image/png',
+            data: asset.data,
+            fps: typeof asset.fps === 'number' ? asset.fps : undefined,
+        });
+    }
+    const assetIds = new Set(assets.map((a) => a.id));
+    const colliderIds = new Set(colliders.map((c) => c.id));
 
-export function playerStart(level: LevelData): Vec2 | undefined {
-    const p = level.player_start;
-    return p ? new Vec2(p.x, p.y) : undefined;
+    const sprites: LevelSprite[] = [];
+    for (const s of Array.isArray(doc.sprites) ? doc.sprites : []) {
+        const sprite = s as Partial<LevelSprite>;
+        if (!sprite.assetId || !assetIds.has(sprite.assetId)) continue;
+        sprites.push({
+            id: sprite.id || newId(),
+            assetId: sprite.assetId,
+            x: num(sprite.x, 0),
+            y: num(sprite.y, 0),
+            scale: num(sprite.scale, 1),
+            layer: sprite.layer === 'background' ? 'background' : 'entity',
+            colliderId:
+                sprite.colliderId && colliderIds.has(sprite.colliderId) ? sprite.colliderId : null,
+        });
+    }
+
+    const now = new Date().toISOString();
+    return {
+        format: LEVEL_FORMAT,
+        version: LEVEL_VERSION,
+        id: typeof doc.id === 'string' && doc.id ? doc.id : newId(),
+        name: typeof doc.name === 'string' && doc.name.trim() ? doc.name : 'Untitled level',
+        createdAt: typeof doc.createdAt === 'string' ? doc.createdAt : now,
+        updatedAt: typeof doc.updatedAt === 'string' ? doc.updatedAt : now,
+        gridSize: Math.max(1, num(doc.gridSize, 32)),
+        playerStart: point(doc.playerStart, 0, 0),
+        chainAnchor: point(doc.chainAnchor, 0, -96),
+        chainLength: Math.max(100, num(doc.chainLength, 1600)),
+        colliders,
+        assets,
+        sprites,
+    };
 }

@@ -9,10 +9,10 @@
         </p>
     }
     <div class="actions">
-        <button class="btn" (click)="game.play()">
+        <button class="btn" (click)="game.replay()">
             {{ i18n.t(kind() === 'win' ? 'play_again' : 'retry') }} <kbd>ENTER</kbd>
         </button>
-        <button class="btn" (click)="game.backToMenu()">
+        <button class="btn" (click)="game.quitRun()">
             {{ i18n.t('back_to_menu') }} <kbd>M</kbd>
         </button>
     </div>

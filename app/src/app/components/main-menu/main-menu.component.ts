@@ -1,9 +1,10 @@
 import { Component, HostListener, inject, signal } from '@angular/core';
 import { GameService } from '../../services/game.service';
+import { LevelStoreService, LevelSummary } from '../../services/level-store.service';
 import { I18nService } from '../../services/i18n.service';
 import { Lang } from '../../i18n/translations';
 
-type MenuScreen = 'main' | 'instructions' | 'credits' | 'language';
+type MenuScreen = 'main' | 'levels' | 'instructions' | 'credits' | 'language';
 
 interface FallingDuck {
     left: number;
@@ -23,11 +24,13 @@ const CREDITS = ['Ana Clara Zoppi', 'Lucas Miranda', 'Lucas Nogueira', 'Nícolas
 })
 export class MainMenuComponent {
     protected readonly game = inject(GameService);
+    protected readonly store = inject(LevelStoreService);
     protected readonly i18n = inject(I18nService);
 
     protected readonly screen = signal<MenuScreen>('main');
     protected readonly selected = signal(0);
     protected readonly credits = CREDITS;
+    protected readonly levels = signal<LevelSummary[] | null>(null);
 
     /** Decorative duck rain, randomized once per menu visit. */
     protected readonly ducks: FallingDuck[] = Array.from({ length: 18 }, () => ({
@@ -40,7 +43,12 @@ export class MainMenuComponent {
     }));
 
     protected readonly items = [
-        { key: 'play', icon: 'assets/icons/play.png', action: () => this.game.play() },
+        { key: 'play', icon: 'assets/icons/play.png', action: () => this.openLevels() },
+        {
+            key: 'level_editor',
+            icon: 'assets/icons/pause.png',
+            action: () => this.game.openEditor(),
+        },
         {
             key: 'instructions',
             icon: 'assets/icons/info.png',
@@ -83,6 +91,31 @@ export class MainMenuComponent {
             default:
                 break;
         }
+    }
+
+    protected openLevels(): void {
+        this.screen.set('levels');
+        void this.refreshLevels();
+    }
+
+    private async refreshLevels(): Promise<void> {
+        this.levels.set(await this.store.list());
+    }
+
+    protected async playLevel(id: string): Promise<void> {
+        const doc = await this.store.get(id);
+        if (doc) await this.game.playLevel(doc);
+    }
+
+    protected async editLevel(id: string): Promise<void> {
+        const doc = await this.store.get(id);
+        if (doc) this.game.openEditor(doc);
+    }
+
+    protected async deleteLevel(id: string, event: Event): Promise<void> {
+        event.stopPropagation();
+        await this.store.delete(id);
+        await this.refreshLevels();
     }
 
     protected selectLang(lang: Lang): void {
