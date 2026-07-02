@@ -46,19 +46,25 @@
     height: 2.6rem;
     display: grid;
     place-items: center;
-    font-size: 1rem;
-    color: var(--text-normal);
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 8px;
     cursor: pointer;
-    transition:
-        color 0.15s ease,
-        border-color 0.15s ease;
+    transition: border-color 0.15s ease;
+
+    img {
+        width: 18px;
+        height: 18px;
+        image-rendering: pixelated;
+        opacity: 0.75;
+    }
 
     &:hover {
-        color: var(--gold-bright);
         border-color: var(--gold);
+
+        img {
+            opacity: 1;
+        }
     }
 }
 

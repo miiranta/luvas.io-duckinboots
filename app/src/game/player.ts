@@ -7,13 +7,13 @@ const ANIM_IDLE = 0;
 const ANIM_WALK = 1;
 
 /** How fast the player gathers speed toward the input direction (px/s²). */
-const ACCELERATION = 1500;
+const ACCELERATION = 1100;
 /** How fast the player coasts to a stop when there is no input (px/s²). */
-const FRICTION = 4000;
+const FRICTION = 3200;
 /** Below this speed (px/s) the player is treated as idle (animation/facing). */
 const MOVING_EPS = 1;
 /** Maximum movement speed in px/s. */
-const MAX_SPEED = 500;
+const MAX_SPEED = 300;
 
 export class Player {
     pos = new Vec2();

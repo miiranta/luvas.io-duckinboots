@@ -7,8 +7,10 @@ import {
     Collider,
     ColliderGrid,
     aabb,
+    circleCollider,
     depenetrateAabb,
     pushRectOutOfAabb,
+    pushRectOutOfCircle,
     resolveAabb,
 } from './collision';
 import {
@@ -48,10 +50,16 @@ export interface WorldAssets {
     ducky: SpriteSheet;
     portalPurple: SpriteSheet;
     portalGreen: SpriteSheet;
-    chainLink: SpriteSheet;
     level: LevelData;
     textures: Map<string, HTMLImageElement>;
 }
+
+/** Total rope length of the chain tethering the player to the anchor. */
+const CHAIN_LENGTH = 1600;
+/** Physics link spacing of the chain (also its visual granularity). */
+const CHAIN_LINK_SIZE = 4;
+/** The chain's rope colour (theme gold). */
+const CHAIN_COLOR = '#e8bd4a';
 
 /** Handle to a thing the player can push/pull. */
 type MovableRef = { kind: 'box'; index: number } | { kind: 'squeezable'; index: number };
@@ -62,6 +70,10 @@ function sameRef(a: MovableRef, b: MovableRef): boolean {
 
 function snapToGrid(v: number): number {
     return Math.round(v / GRID_SIZE) * GRID_SIZE;
+}
+
+function isOnGrid(v: number): boolean {
+    return Math.abs(v - snapToGrid(v)) < 1e-6;
 }
 
 /**
@@ -124,6 +136,8 @@ export class World {
 
     private readonly staticColliders: Collider[];
     private readonly barColliders: Collider[];
+    /** Statics + bars: the never-changing solid set, built once. */
+    private readonly immovableColliders: Collider[];
     private readonly staticGrid: ColliderGrid;
     private readonly boxes: MovableBox[];
     private readonly playerStartPos: Vec2;
@@ -158,6 +172,7 @@ export class World {
         this.staticColliders = staticCollidersFrom(this.level);
         this.staticGrid = new ColliderGrid(this.staticColliders);
         this.barColliders = barCollidersFrom(this.level);
+        this.immovableColliders = [...this.staticColliders, ...this.barColliders];
         this.boxes = movableBoxesFrom(this.level, snapToGrid);
         this.playerStartPos = playerStartOf(this.level);
 
@@ -172,15 +187,10 @@ export class World {
         this.portals = new Portals(assets.portalPurple, assets.portalGreen);
     }
 
-    /** Build the three chains tethering the player to the anchor. */
+    /** Build the chain tethering the player to the anchor. */
     private newChains(): PortalChain[] {
         const start = this.player.pos.add(this.player.chainOffset);
-        const sheet = this.assets.chainLink;
-        return [
-            new PortalChain(CHAIN_ANCHOR, start, 1600, 3, '#e62937', sheet),
-            new PortalChain(CHAIN_ANCHOR, start, 2400, 3, '#00e430', sheet),
-            new PortalChain(CHAIN_ANCHOR, start, 3200, 3, '#66bfff', sheet),
-        ];
+        return [new PortalChain(CHAIN_ANCHOR, start, CHAIN_LENGTH, CHAIN_LINK_SIZE, CHAIN_COLOR)];
     }
 
     /** True when every squeezable has been crushed (the win condition). */
@@ -276,8 +286,8 @@ export class World {
 
     /** The player's *movement* set: just the immovable world (statics + bars). */
     private rebuildMoveColliders(): void {
-        this.moveColliders.length = 0;
-        this.moveColliders.push(...this.staticColliders, ...this.barColliders);
+        // The immovable set never changes; share the prebuilt array.
+        this.moveColliders = this.immovableColliders;
     }
 
     /** Every movable this frame as `(handle, current AABB)`. */
@@ -299,16 +309,34 @@ export class World {
      * Obstacles a single movable may move against: the immovable world plus
      * every *other* movable (so movables can't be shoved through each other).
      */
+    /**
+     * Minimum translation that separates a movable from the player, or `null`
+     * when they don't overlap. Boxes separate along the axis of least rect
+     * overlap; squeezables separate **radially** (they are circles), so
+     * pushing one feels round instead of boxy.
+     */
+    private pushSeparation(ref: MovableRef, rect: Rect): Vec2 | null {
+        const player = this.player.collider();
+        if (ref.kind === 'box') {
+            const push = pushRectOutOfAabb(rect.position(), rect.size(), player);
+            return push ? push[0].sub(rect.position()) : null;
+        }
+        // Circle case: push the *player* out of the circle, then move the
+        // circle by the opposite vector (equivalent separation).
+        const center = rect.center();
+        const radius = rect.width / 2;
+        const pushedPlayer = pushRectOutOfCircle(this.player.pos, this.player.shape, center, radius);
+        return pushedPlayer ? this.player.pos.sub(pushedPlayer) : null;
+    }
+
     private movableObstacles(skip: MovableRef): Collider[] {
-        const obstacles: Collider[] = [...this.staticColliders, ...this.barColliders];
+        const obstacles: Collider[] = [...this.immovableColliders];
         this.boxes.forEach((b, index) => {
             if (!sameRef(skip, { kind: 'box', index })) obstacles.push(aabb(b.rect));
         });
         for (const { index, center, radius } of this.squeezables.eachAlive()) {
             if (!sameRef(skip, { kind: 'squeezable', index })) {
-                obstacles.push(
-                    aabb(new Rect(center.x - radius, center.y - radius, radius * 2, radius * 2)),
-                );
+                obstacles.push(circleCollider(center, radius));
             }
         }
         return obstacles;
@@ -344,10 +372,9 @@ export class World {
         if (this.player.abilities.push) {
             for (const { ref, rect } of movables) {
                 if (pull && sameRef(ref, pull.ref)) continue;
-                const push = pushRectOutOfAabb(rect.position(), rect.size(), this.player.collider());
-                if (!push) continue;
+                const want = this.pushSeparation(ref, rect);
+                if (!want) continue;
                 if (ref.kind === 'box') touched[ref.index] = true;
-                const want = push[0].sub(rect.position());
                 const moved = this.resolveMovable(ref, rect, want);
                 this.moveMovable(ref, moved);
 
@@ -444,6 +471,10 @@ export class World {
     /** Settle box `i` onto the grid, contact-aware (never off a wall). */
     private snapBox(i: number): void {
         const rect = this.boxes[i].rect;
+        // Fast path: resting boxes are already on the grid, so skip the whole
+        // obstacle build + contact probing (this runs for every box every
+        // frame; the expensive path is only ever taken just after a push).
+        if (isOnGrid(rect.x) && isOnGrid(rect.y)) return;
         // The player counts as an obstacle too, so settling never snaps a box
         // *into* the player (which would depenetrate them into a wall).
         const obstacles = this.movableObstacles({ kind: 'box', index: i });
@@ -460,6 +491,7 @@ export class World {
     /** Snap the player to the grid once it has fully stopped (contact-aware). */
     private snapPlayer(): void {
         if (this.player.velocity.x !== 0 || this.player.velocity.y !== 0) return;
+        if (isOnGrid(this.player.pos.x) && isOnGrid(this.player.pos.y)) return;
         const rect = this.player.collider();
         const [bnX, bpX] = this.blockedAxes(rect, Vec2.X, this.playerColliders);
         const [bnY, bpY] = this.blockedAxes(rect, Vec2.Y, this.playerColliders);
@@ -486,10 +518,7 @@ export class World {
         const movable: Collider[] = this.boxes.map((b) => aabb(b.rect));
         this.squeezables.extendColliders(movable);
         this.player.pos = depenetrateAabb(this.player.pos, this.player.shape, movable);
-        this.player.pos = depenetrateAabb(this.player.pos, this.player.shape, [
-            ...this.staticColliders,
-            ...this.barColliders,
-        ]);
+        this.player.pos = depenetrateAabb(this.player.pos, this.player.shape, this.immovableColliders);
     }
 
     // ── Chains + portals ─────────────────────────────────────────────────────
@@ -614,17 +643,21 @@ export class World {
         camera.zoom = this.zoom;
         camera.apply(ctx, height);
 
-        this.drawYSorted(ctx);
+        // The visible world rect (plus a margin) — everything outside is
+        // culled, which matters with 1000+ sprite instances in the level.
+        const scale = camera.effectiveZoom(height);
+        const view = new Rect(
+            camera.target.x - width / 2 / scale,
+            camera.target.y - height / 2 / scale,
+            width / scale,
+            height / scale,
+        ).grow(64);
+
+        this.drawYSorted(ctx, view);
         if (this.debugCollisions) this.drawDebug(ctx);
         this.squeezables.draw(ctx);
 
-        // Chains largest-first so the shortest stacks on top; opacity ramps
-        // down toward zero on the longest so deeper layers fade out.
-        const ordered = [...this.chains].sort((a, b) => b.maxLength() - a.maxLength());
-        ordered.forEach((chain, i) => {
-            const alpha = Math.pow((i + 1) / ordered.length, 4);
-            chain.draw(ctx, alpha);
-        });
+        for (const chain of this.chains) chain.draw(ctx, 1);
 
         // The anchor point.
         ctx.fillStyle = '#ffcb00';
@@ -646,19 +679,31 @@ export class World {
      * first, then a Y-sort (by bottom edge, "feet") of the player and every
      * sprite at least as large as the player; smaller props draw last on top.
      */
-    private drawYSorted(ctx: CanvasRenderingContext2D): void {
+    private drawYSorted(ctx: CanvasRenderingContext2D, view: Rect): void {
         const instances = this.level.sprite_instances ?? [];
         const playerMin = this.player.spriteMinDim();
 
+        const visible = (i: number): boolean => {
+            const inst = instances[i];
+            const tex = this.textures.get(inst.path);
+            if (!tex) return false;
+            return (
+                inst.x < view.right &&
+                inst.x + tex.naturalWidth * inst.scale > view.x &&
+                inst.y < view.bottom &&
+                inst.y + tex.naturalHeight * inst.scale > view.y
+            );
+        };
+
         for (let i = 0; i < instances.length; i++) {
-            if (instances[i].background) this.drawSprite(ctx, i);
+            if (instances[i].background && visible(i)) this.drawSprite(ctx, i);
         }
 
         const order: { y: number; sprite: number | null }[] = [];
         const small: number[] = [];
         for (let i = 0; i < instances.length; i++) {
             const inst = instances[i];
-            if (inst.background) continue;
+            if (inst.background || !visible(i)) continue;
             const tex = this.textures.get(inst.path);
             const w = tex ? tex.naturalWidth * inst.scale : 0;
             const h = tex ? tex.naturalHeight * inst.scale : 0;

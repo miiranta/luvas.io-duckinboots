@@ -37,6 +37,7 @@
                         (mouseenter)="selected.set(i)"
                         (click)="item.action()"
                     >
+                        <img class="btn-icon" [src]="item.icon" alt="" />
                         {{ i18n.t(item.key) }}
                     </button>
                 }

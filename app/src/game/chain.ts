@@ -1,5 +1,4 @@
 import { Rect, Vec2 } from '../engine/math';
-import { Animation, SpriteSheet } from '../engine/sprite-sheet';
 import {
     Collider,
     ColliderGrid,
@@ -19,7 +18,7 @@ const DAMPING = 0.025;
 /** Bend resistance as the chain stretches (0 floppy … 1 cable-straight). */
 const STRAIGHTNESS = 0.7;
 /** Distance-constraint iterations per frame. */
-const CONSTRAINT_ITERATIONS = 20;
+const CONSTRAINT_ITERATIONS = 12;
 /** Fraction of post-constraint velocity kept on tensioned joints (organic ripple). */
 const INERTIA_KEEP = 0.15;
 /** Stop iterating once corrections are sub-pixel. */
@@ -50,8 +49,6 @@ export class Chain {
     readonly segmentLength: number;
     readonly linkSize: number;
     private readonly color: string;
-    private readonly sheet: SpriteSheet;
-    private readonly anim: Animation;
 
     private readonly wasConstrained: boolean[];
     private readonly obstacleConstrained: boolean[];
@@ -59,21 +56,14 @@ export class Chain {
     private readonly jointObstacles: Collider[][];
     /** Every obstacle near the whole chain this frame (one grid query). */
     private chainObstacles: Collider[] = [];
+    /** Animated dash offset that makes the link pattern crawl along the rope. */
+    private dashPhase = 0;
 
-    constructor(
-        start: Vec2,
-        end: Vec2,
-        totalLength: number,
-        linkSize: number,
-        color: string,
-        sheet: SpriteSheet,
-    ) {
+    constructor(start: Vec2, end: Vec2, totalLength: number, linkSize: number, color: string) {
         const numSegments = Math.max(1, Math.ceil(totalLength / linkSize));
         this.segmentLength = totalLength / numSegments;
         this.linkSize = linkSize;
         this.color = color;
-        this.sheet = sheet;
-        this.anim = new Animation(sheet, 0, 8, true);
 
         this.joints = [];
         for (let i = 0; i <= numSegments; i++) {
@@ -88,28 +78,26 @@ export class Chain {
 
     /**
      * Build a chain directly from an explicit polyline — used for **frozen
-     * snippets** captured when a chain splits at a portal. Never simulated,
-     * only drawn and re-straightened via `setJointPositions`.
+     * snippets** captured when a chain splits at a portal, and for rebuilding
+     * the active snippet from a known-good (collision-respecting) shape.
      */
     static fromPoints(
         points: readonly Vec2[],
         segmentLength: number,
         linkSize: number,
         color: string,
-        sheet: SpriteSheet,
     ): Chain {
         const chain = Object.create(Chain.prototype) as Chain;
         Object.assign(chain, {
             segmentLength,
             linkSize,
             color,
-            sheet,
-            anim: new Animation(sheet, 0, 8, true),
             joints: points.map((p) => ({ pos: p.clone(), oldPos: p.clone() })),
             wasConstrained: new Array(points.length).fill(false),
             obstacleConstrained: new Array(points.length).fill(false),
             jointObstacles: Array.from({ length: points.length }, () => []),
             chainObstacles: [],
+            dashPhase: 0,
         });
         return chain;
     }
@@ -196,7 +184,7 @@ export class Chain {
         };
     }
 
-    /** Iterate `(pos)` of every joint — used by the squeeze detection. */
+    /** Every joint position — used by the squeeze detection. */
     jointPositions(): readonly Vec2[] {
         return this.joints.map((j) => j.pos);
     }
@@ -227,7 +215,7 @@ export class Chain {
         const n = this.joints.length;
         if (n < 2) return;
 
-        this.anim.update(dt);
+        this.dashPhase += dt * 14;
 
         // ── Broad phase: one grid query per chain, filtered per joint ───────
         const margin = this.segmentLength * 2 + 8;
@@ -352,55 +340,44 @@ export class Chain {
     }
 
     /**
-     * Draw the chain: a metallic link sprite every couple of joints, tinted by
-     * the chain colour, its shimmer frame offset by joint index so the effect
-     * travels along the chain. `alpha` fades deeper chains behind shorter ones.
+     * Draw the chain as a clean layered rope: a dark outline, a coloured
+     * core, a thin highlight, and an animated dark dash pattern that reads as
+     * links crawling along the cable. Widths are in world pixels and kept
+     * slim; `alpha` lets the caller fade the whole rope.
      */
     draw(ctx: CanvasRenderingContext2D, alpha: number): void {
         const n = this.joints.length;
         if (n < 2) return;
 
-        const frameCount = Math.max(1, this.sheet.frameCount(0));
-        const DRAW_EVERY = 2;
-        const scale = (this.linkSize * 3) / this.sheet.frameW;
-        const halfW = (this.sheet.frameW * scale) / 2;
-        const halfH = (this.sheet.frameH * scale) / 2;
-
-        const drawLink = (i: number, drawIndex: number) => {
-            const joint = this.joints[i];
-            const prev = i === 0 ? joint.pos : this.joints[i - 1].pos;
-            const next = i === n - 1 ? joint.pos : this.joints[i + 1].pos;
-            const rotation = next.sub(prev).angle();
-            const frame = (this.anim.currentFrame() + drawIndex) % frameCount;
-            const cols = this.sheet.framesInRow(0);
-            const col = cols[frame] ?? 0;
-            this.sheet.drawFrame(
-                ctx,
-                col,
-                0,
-                new Vec2(joint.pos.x - halfW, joint.pos.y - halfH),
-                scale,
-                { rotation, alpha },
-            );
-        };
-
-        // Tint via a colour overlay: draw links, then a soft line in the chain
-        // colour along the path (cheap and keeps the metallic sprite look).
-        let drawIndex = 0;
-        for (let i = 0; i < n; i += DRAW_EVERY) {
-            drawLink(i, drawIndex++);
-        }
-        if ((n - 1) % DRAW_EVERY !== 0) drawLink(n - 1, drawIndex);
-
         ctx.save();
-        ctx.globalAlpha *= alpha * 0.45;
-        ctx.strokeStyle = this.color;
-        ctx.lineWidth = this.linkSize;
+        ctx.globalAlpha *= alpha;
         ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+
         ctx.beginPath();
         ctx.moveTo(this.joints[0].pos.x, this.joints[0].pos.y);
         for (let i = 1; i < n; i++) ctx.lineTo(this.joints[i].pos.x, this.joints[i].pos.y);
+
+        // Outline → core → link dashes → highlight, all on the same path.
+        ctx.strokeStyle = 'rgb(8 8 14 / 60%)';
+        ctx.lineWidth = 3.2;
         ctx.stroke();
+
+        ctx.strokeStyle = this.color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.setLineDash([3, 2.2]);
+        ctx.lineDashOffset = -this.dashPhase;
+        ctx.strokeStyle = 'rgb(0 0 0 / 28%)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.strokeStyle = 'rgb(255 255 255 / 30%)';
+        ctx.lineWidth = 0.7;
+        ctx.stroke();
+
         ctx.restore();
     }
 }

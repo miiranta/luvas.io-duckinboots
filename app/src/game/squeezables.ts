@@ -1,6 +1,6 @@
-import { Rect, Vec2 } from '../engine/math';
+import { Vec2 } from '../engine/math';
 import { Chain } from './chain';
-import { Collider, aabb } from './collision';
+import { Collider, circleCollider } from './collision';
 
 /**
  * Squeezable objects: round things a chain can lasso. When a chain winds a
@@ -61,10 +61,14 @@ export class Squeezables {
         return this.items.length;
     }
 
-    /** Append an AABB collider for each living object. */
+    /**
+     * Append a **circle** collider for each living object, so the chain hugs
+     * the round shape (the original used the bounding box, which made chains
+     * wrap a square and the tight-loop squeeze test nearly impossible).
+     */
     extendColliders(out: Collider[]): void {
         for (const s of this.items) {
-            if (s.alive) out.push(aabb(boundsOf(s.pos, s.radius)));
+            if (s.alive) out.push(circleCollider(s.pos.clone(), s.radius));
         }
     }
 
@@ -113,10 +117,6 @@ export class Squeezables {
             ctx.fill();
         }
     }
-}
-
-function boundsOf(center: Vec2, radius: number): Rect {
-    return new Rect(center.x - radius, center.y - radius, radius * 2, radius * 2);
 }
 
 /**

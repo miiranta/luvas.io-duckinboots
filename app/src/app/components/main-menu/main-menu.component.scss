@@ -132,6 +132,19 @@
     }
 }
 
+.btn-icon {
+    width: 20px;
+    height: 20px;
+    image-rendering: pixelated;
+    opacity: 0.65;
+    transition: opacity 0.15s ease;
+}
+
+.btn:hover .btn-icon,
+.btn.selected .btn-icon {
+    opacity: 1;
+}
+
 .menu-panel {
     display: flex;
     flex-direction: column;

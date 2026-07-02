@@ -38,11 +38,10 @@ export class GameService {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d') ?? undefined;
 
-        const [duckyImg, purpleImg, greenImg, chainImg, level] = await Promise.all([
+        const [duckyImg, purpleImg, greenImg, level] = await Promise.all([
             loadImage('assets/sprites/ducky_spritesheet.png'),
             loadImage('assets/sprites/portal_purple.png'),
             loadImage('assets/sprites/portal_green.png'),
-            loadImage('assets/sprites/chain_link.png'),
             loadJson<LevelData>('assets/level.json'),
         ]);
         const paths = (level.sprite_instances ?? []).map((i) => `assets/${i.path}`);
@@ -55,7 +54,6 @@ export class GameService {
             ducky: new SpriteSheet(duckyImg, 32, 32),
             portalPurple: new SpriteSheet(purpleImg, 64, 64),
             portalGreen: new SpriteSheet(greenImg, 64, 64),
-            chainLink: new SpriteSheet(chainImg, 64, 64),
             level,
             textures,
         });

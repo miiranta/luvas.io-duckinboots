@@ -7,7 +7,9 @@
         <span class="stat-label">{{ i18n.t('fps_label') }}</span>
         <span class="stat-value">{{ game.fps() }}</span>
     </div>
-    <button class="pause-btn" (click)="game.pause()" aria-label="Pause">Ⅱ</button>
+    <button class="pause-btn" (click)="game.pause()" aria-label="Pause">
+        <img src="assets/icons/pause.png" alt="" />
+    </button>
 </div>
 
 <p class="hud-bottom hint">{{ i18n.t('hud_controls') }}</p>

@@ -40,10 +40,22 @@ export class MainMenuComponent {
     }));
 
     protected readonly items = [
-        { key: 'play', action: () => this.game.play() },
-        { key: 'instructions', action: () => this.screen.set('instructions') },
-        { key: 'credits', action: () => this.screen.set('credits') },
-        { key: 'language', action: () => this.screen.set('language') },
+        { key: 'play', icon: 'assets/icons/play.png', action: () => this.game.play() },
+        {
+            key: 'instructions',
+            icon: 'assets/icons/info.png',
+            action: () => this.screen.set('instructions'),
+        },
+        {
+            key: 'credits',
+            icon: 'assets/icons/people.png',
+            action: () => this.screen.set('credits'),
+        },
+        {
+            key: 'language',
+            icon: 'assets/icons/language.png',
+            action: () => this.screen.set('language'),
+        },
     ] as const;
 
     @HostListener('window:keydown', ['$event'])
