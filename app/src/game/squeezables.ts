@@ -86,15 +86,19 @@ export class Squeezables {
     }
 
     /**
-     * Check every living object against every chain snippet; crush the ones a
-     * chain has looped tight and fire the listeners. Call once per frame after
-     * the chains have been simulated.
+     * Check every living object against every rope span; crush the ones a
+     * chain has looped tight and fire the listeners. Call once per frame
+     * after the chains have been simulated.
      */
     update(chains: readonly Chain[]): void {
         const crushed: SqueezeEvent[] = [];
         for (const s of this.items) {
             if (!s.alive) continue;
-            if (chains.some((c) => chainCinches(c, s.pos, s.radius))) {
+            const cinched = chains.some((chain) => {
+                const stretch = chain.stretch();
+                return chain.spanPoints().some((pts) => spanCinches(pts, stretch, s.pos, s.radius));
+            });
+            if (cinched) {
                 s.alive = false;
                 crushed.push({ id: s.id, pos: s.pos, radius: s.radius });
             }
@@ -104,37 +108,42 @@ export class Squeezables {
         }
     }
 
-    draw(ctx: CanvasRenderingContext2D): void {
-        for (const s of this.items) {
-            if (!s.alive) continue;
-            ctx.fillStyle = '#f5008c';
-            ctx.beginPath();
-            ctx.arc(s.pos.x, s.pos.y, s.radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = '#ff8fc8';
-            ctx.beginPath();
-            ctx.arc(s.pos.x, s.pos.y, s.radius * 0.7, 0, Math.PI * 2);
-            ctx.fill();
-        }
+    /** Draw one living object (used by the world's Y-sort). */
+    drawItem(ctx: CanvasRenderingContext2D, index: number): void {
+        const s = this.items[index];
+        if (!s?.alive) return;
+        ctx.fillStyle = '#f5008c';
+        ctx.beginPath();
+        ctx.arc(s.pos.x, s.pos.y, s.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ff8fc8';
+        ctx.beginPath();
+        ctx.arc(s.pos.x, s.pos.y, s.radius * 0.7, 0, Math.PI * 2);
+        ctx.fill();
     }
 }
 
 /**
- * Does `chain` wind a full, tight loop around the circle at `center`?
+ * Does a rope span wind a full, tight loop around the circle at `center`?
  * Three conditions must hold together:
  * 1. **Winding** — the path's radial vector sweeps ≥ one full turn;
  * 2. **Tight loop** — the polygon area of joints hugging the object is close
  *    to the object's own area;
- * 3. **Force** — the overall chain is stretched (pulled tight, not draped).
+ * 3. **Force** — the whole rope is stretched (pulled tight, not draped).
  */
-function chainCinches(chain: Chain, center: Vec2, radius: number): boolean {
+function spanCinches(
+    points: readonly Vec2[],
+    stretch: number,
+    center: Vec2,
+    radius: number,
+): boolean {
     const inner = radius * LOOP_INNER_FACTOR;
     const outer = radius * LOOP_OUTER_FACTOR;
     let winding = 0;
     const loopPoints: Vec2[] = [];
     let prev: Vec2 | null = null;
 
-    for (const p of chain.jointPositions()) {
+    for (const p of points) {
         const v = p.sub(center);
         const dist = v.length();
         if (dist >= inner && dist <= outer) loopPoints.push(p);
@@ -151,7 +160,7 @@ function chainCinches(chain: Chain, center: Vec2, radius: number): boolean {
     return (
         Math.abs(winding) / (Math.PI * 2) >= FULL_LOOP_TURNS &&
         areaDiffRatio <= MAX_AREA_DIFF_RATIO &&
-        chain.stretch() >= MIN_CHAIN_STRETCH
+        stretch >= MIN_CHAIN_STRETCH
     );
 }
 

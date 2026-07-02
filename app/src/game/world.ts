@@ -22,9 +22,8 @@ import {
     spawnItemSqueezables,
     staticCollidersFrom,
 } from './level-setup';
-import { Chain } from './chain';
 import { Player } from './player';
-import { PortalChain } from './portal-chain';
+import { Chain } from './chain';
 import { Portals } from './portals';
 import { Squeezables } from './squeezables';
 
@@ -142,7 +141,7 @@ export class World {
     private readonly boxes: MovableBox[];
     private readonly playerStartPos: Vec2;
 
-    private chains: PortalChain[] = [];
+    private chains: Chain[] = [];
     private portals: Portals;
     private portalsRestarting = false;
     private crossingExits: Circle[] = [];
@@ -188,9 +187,9 @@ export class World {
     }
 
     /** Build the chain tethering the player to the anchor. */
-    private newChains(): PortalChain[] {
+    private newChains(): Chain[] {
         const start = this.player.pos.add(this.player.chainOffset);
-        return [new PortalChain(CHAIN_ANCHOR, start, CHAIN_LENGTH, CHAIN_LINK_SIZE, CHAIN_COLOR)];
+        return [new Chain(CHAIN_ANCHOR, start, CHAIN_LENGTH, CHAIN_LINK_SIZE, CHAIN_COLOR)];
     }
 
     /** True when every squeezable has been crushed (the win condition). */
@@ -263,8 +262,7 @@ export class World {
         for (const chain of this.chains) chain.setEnd(end);
 
         // Crush anything a chain has cinched tight.
-        const snippets: Chain[] = this.chains.flatMap((c) => [...c.allSnippets()]);
-        this.squeezables.update(snippets);
+        this.squeezables.update(this.chains);
     }
 
     // ── Collider set management ──────────────────────────────────────────────
@@ -529,19 +527,10 @@ export class World {
      * avoiding micro-oscillation.
      */
     private stepChains(dt: number): void {
-        const frozen =
+        const still =
             this.playerStillFor >= PLAYER_STILL_THRESHOLD &&
             this.chains.every((c) => c.isStill(CHAIN_STILL_THRESHOLD));
         const end = this.player.chainPoint();
-
-        if (frozen) {
-            for (const chain of this.chains) {
-                chain.setStart(CHAIN_ANCHOR);
-                chain.setEnd(end);
-                chain.applyPullthrough(this.staticGrid);
-            }
-            return;
-        }
 
         this.dynamicColliders.length = 0;
         for (const b of this.boxes) this.dynamicColliders.push(aabb(b.rect));
@@ -550,8 +539,9 @@ export class World {
         for (const chain of this.chains) {
             chain.setStart(CHAIN_ANCHOR);
             chain.setEnd(end);
-            chain.updateActive(dt, this.staticGrid, this.dynamicColliders);
-            chain.applyPullthrough(this.staticGrid);
+            // When everything is still, skip the active-span simulation (the
+            // pull-through tightening still runs — it's demand-driven).
+            chain.update(dt, this.staticGrid, this.dynamicColliders, !still);
         }
     }
 
@@ -612,7 +602,7 @@ export class World {
         for (let iter = 0; iter < CHAIN_CLAMP_ITERS; iter++) {
             let target = this.player.chainPoint();
             for (const chain of this.chains) {
-                const { tether, freeLength } = chain.activeTether();
+                const { tether, freeLength } = chain.tether();
                 const dist = tether.distance(target);
                 if (dist > freeLength) {
                     const dir = target.sub(tether).normalize(new Vec2(0, -1));
@@ -653,70 +643,77 @@ export class World {
             height / scale,
         ).grow(64);
 
-        this.drawYSorted(ctx, view);
-        if (this.debugCollisions) this.drawDebug(ctx);
-        this.squeezables.draw(ctx);
-
+        // Floor decals first (chains, anchor, portals): the rope lies on the
+        // ground, so tall Y-sorted sprites and the player draw *over* it.
+        // Drawing chains above everything (as the original did) made a rope
+        // passing "behind" a statue look like it clipped through it.
+        this.drawBackgroundSprites(ctx, view);
         for (const chain of this.chains) chain.draw(ctx, 1);
-
-        // The anchor point.
         ctx.fillStyle = '#ffcb00';
         ctx.beginPath();
         ctx.arc(CHAIN_ANCHOR.x, CHAIN_ANCHOR.y, 6, 0, Math.PI * 2);
         ctx.fill();
-
-        // Portals above the chains so crossing points stay visible.
         this.portals.draw(ctx);
 
-        // The player on top.
-        this.player.draw(ctx);
+        this.drawYSorted(ctx, view);
+        if (this.debugCollisions) this.drawDebug(ctx);
 
         ctx.restore();
     }
 
+    private spriteVisible(i: number, view: Rect): boolean {
+        const inst = (this.level.sprite_instances ?? [])[i];
+        const tex = this.textures.get(inst.path);
+        if (!tex) return false;
+        return (
+            inst.x < view.right &&
+            inst.x + tex.naturalWidth * inst.scale > view.x &&
+            inst.y < view.bottom &&
+            inst.y + tex.naturalHeight * inst.scale > view.y
+        );
+    }
+
+    /** The flat ground layer: background-flagged sprites, under everything. */
+    private drawBackgroundSprites(ctx: CanvasRenderingContext2D, view: Rect): void {
+        const instances = this.level.sprite_instances ?? [];
+        for (let i = 0; i < instances.length; i++) {
+            if (instances[i].background && this.spriteVisible(i, view)) this.drawSprite(ctx, i);
+        }
+    }
+
     /**
-     * Sprite instances and the player with depth ordering: background sprites
-     * first, then a Y-sort (by bottom edge, "feet") of the player and every
-     * sprite at least as large as the player; smaller props draw last on top.
+     * Entities with depth ordering: a Y-sort (by bottom edge, "feet") of the
+     * player, the squeezable balls, and every sprite at least as large as the
+     * player; smaller props draw last on top.
      */
     private drawYSorted(ctx: CanvasRenderingContext2D, view: Rect): void {
         const instances = this.level.sprite_instances ?? [];
         const playerMin = this.player.spriteMinDim();
 
-        const visible = (i: number): boolean => {
-            const inst = instances[i];
-            const tex = this.textures.get(inst.path);
-            if (!tex) return false;
-            return (
-                inst.x < view.right &&
-                inst.x + tex.naturalWidth * inst.scale > view.x &&
-                inst.y < view.bottom &&
-                inst.y + tex.naturalHeight * inst.scale > view.y
-            );
-        };
-
-        for (let i = 0; i < instances.length; i++) {
-            if (instances[i].background && visible(i)) this.drawSprite(ctx, i);
-        }
-
-        const order: { y: number; sprite: number | null }[] = [];
+        const order: { y: number; draw: () => void }[] = [];
         const small: number[] = [];
         for (let i = 0; i < instances.length; i++) {
             const inst = instances[i];
-            if (inst.background || !visible(i)) continue;
+            if (inst.background || !this.spriteVisible(i, view)) continue;
             const tex = this.textures.get(inst.path);
             const w = tex ? tex.naturalWidth * inst.scale : 0;
             const h = tex ? tex.naturalHeight * inst.scale : 0;
             if (Math.min(w, h) < playerMin) small.push(i);
-            else order.push({ y: inst.y + h, sprite: i });
+            else order.push({ y: inst.y + h, draw: () => this.drawSprite(ctx, i) });
         }
-        order.push({ y: this.player.pos.y + this.player.shape.y, sprite: null });
+        order.push({
+            y: this.player.pos.y + this.player.shape.y,
+            draw: () => this.player.draw(ctx),
+        });
+        for (const { index, center, radius } of this.squeezables.eachAlive()) {
+            order.push({
+                y: center.y + radius,
+                draw: () => this.squeezables.drawItem(ctx, index),
+            });
+        }
         order.sort((a, b) => a.y - b.y);
 
-        for (const { sprite } of order) {
-            if (sprite === null) this.player.draw(ctx);
-            else this.drawSprite(ctx, sprite);
-        }
+        for (const entry of order) entry.draw();
         for (const i of small) this.drawSprite(ctx, i);
     }
 

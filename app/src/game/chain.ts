@@ -13,164 +13,180 @@ interface Joint {
     oldPos: Vec2;
 }
 
+/**
+ * One contiguous stretch of rope. The last span is *active* (simulated,
+ * following the player); every earlier span is *frozen*: pinned between two
+ * fixed anchors (the world anchor or a portal exit on one side, a portal
+ * entrance on the other) and only ever tightened, never simulated.
+ */
+interface Span {
+    joints: Joint[];
+    /** Straight-line length between the pinned ends (rope consumed fully taut). */
+    fMin: number;
+}
+
 /** Velocity retention per second for slack (un-tensioned) joints. */
 const DAMPING = 0.025;
-/** Bend resistance as the chain stretches (0 floppy … 1 cable-straight). */
+/** Bend resistance as the rope stretches (0 floppy … 1 cable-straight). */
 const STRAIGHTNESS = 0.7;
 /** Distance-constraint iterations per frame. */
 const CONSTRAINT_ITERATIONS = 12;
-/** Fraction of post-constraint velocity kept on tensioned joints (organic ripple). */
+/** Fraction of post-constraint velocity kept on tensioned joints. */
 const INERTIA_KEEP = 0.15;
 /** Stop iterating once corrections are sub-pixel. */
 const CONSTRAINT_EPS_SQ = 0.0001;
+/** Midpoint-relaxation strength used to tighten frozen spans. */
+const TIGHTEN_STRENGTH = 0.35;
 
 /**
- * A chain simulated as a series of rigid links between two pinned endpoints —
- * a heavy cable dragged across a flat (top-down, gravity-free) surface.
+ * A rope tethering the player to a fixed anchor, able to thread through
+ * portals.
  *
- * Physics model, preserved from the original and hardened:
+ * The rope is a list of [`Span`]s sharing one fixed length `budget`. Crossing
+ * a portal `split`s the rope: the active span freezes in place and a new
+ * collapsed active span emerges from the exit portal. Crossing back `merge`s:
+ * the frozen span is reabsorbed, continuing from its current shape. As the
+ * player pulls rope through, frozen spans tighten toward taut, giving their
+ * slack to the active span.
  *
- * - **Swept joints** — every joint movement goes through a swept point query,
- *   so joints can never tunnel through geometry. This is the single invariant
- *   the whole no-teleport guarantee rests on.
+ * # Physics model
+ *
+ * - **Swept joints** — every joint movement (simulation *and* frozen-span
+ *   tightening) goes through a swept point query against the same obstacle
+ *   set, so no part of the rope can ever pass through geometry. This is the
+ *   single invariant the no-clip guarantee rests on.
+ * - **Bucket coverage** — per-joint obstacle buckets are re-gathered whenever
+ *   a move would leave the neighbourhood they were built for, so a hard yank
+ *   cascading down the rope can never outrun the broad phase.
  * - **Propagation from the player end** — constraints run end→anchor first,
  *   so when slack only the links near the player move.
- * - **Immediate settling** — joints pressed against a wall drop all velocity;
- *   tensioned joints keep only a small ripple (`INERTIA_KEEP`).
- * - **Bend resistance** — joints are pulled toward their neighbours' midpoint,
- *   scaled by path stretch, so the chain reads as taut when extended.
- *
- * Broad phase: one grid query over the chain's bounding box per frame, then a
- * cheap per-joint AABB filter — the grid is walked once per chain, not once
- * per joint.
+ * - **Pulley tightening** — frozen spans shorten by midpoint relaxation with
+ *   swept moves: the rope wraps corners (and squeezables) like a rope over a
+ *   pulley, tightening exactly as far as the obstacles allow.
  */
 export class Chain {
-    private readonly joints: Joint[];
-    readonly segmentLength: number;
+    /** `[frozen…, active]`; always at least one span. */
+    private spans: Span[];
+    /** Total rope length, conserved across all spans. */
+    private readonly budget: number;
     readonly linkSize: number;
+    readonly segmentLength: number;
     private readonly color: string;
 
-    private readonly wasConstrained: boolean[];
-    private readonly obstacleConstrained: boolean[];
-    /** Per-joint obstacle candidates, rebuilt each frame (arrays reused). */
-    private readonly jointObstacles: Collider[][];
-    /** Every obstacle near the whole chain this frame (one grid query). */
+    // Simulation scratch for the active span (index-aligned with its joints).
+    private wasConstrained: boolean[] = [];
+    private obstacleConstrained: boolean[] = [];
+    private jointObstacles: Collider[][] = [];
+    private bucketOrigin: (Vec2 | null)[] = [];
+    private bucketMargin = 0;
+    /** Collision context of the current update, for bucket refreshes. */
+    private frameGrid: ColliderGrid | null = null;
+    private frameDynamics: readonly Collider[] = [];
+    /** Every obstacle near the active span this frame (one grid query). */
     private chainObstacles: Collider[] = [];
     /** Animated dash offset that makes the link pattern crawl along the rope. */
     private dashPhase = 0;
 
-    constructor(start: Vec2, end: Vec2, totalLength: number, linkSize: number, color: string) {
+    constructor(anchor: Vec2, end: Vec2, totalLength: number, linkSize: number, color: string) {
         const numSegments = Math.max(1, Math.ceil(totalLength / linkSize));
         this.segmentLength = totalLength / numSegments;
+        this.budget = totalLength;
         this.linkSize = linkSize;
         this.color = color;
+        this.spans = [this.straightSpan(anchor, end, numSegments + 1)];
+        this.resizeScratch();
+    }
 
-        this.joints = [];
-        for (let i = 0; i <= numSegments; i++) {
-            const pos = start.lerp(end, i / numSegments);
-            this.joints.push({ pos, oldPos: pos.clone() });
+    // ── Span helpers ─────────────────────────────────────────────────────────
+
+    private straightSpan(a: Vec2, b: Vec2, jointCount: number): Span {
+        const joints: Joint[] = [];
+        for (let i = 0; i < jointCount; i++) {
+            const pos = a.lerp(b, i / (jointCount - 1));
+            joints.push({ pos, oldPos: pos.clone() });
         }
-        const n = this.joints.length;
-        this.wasConstrained = new Array(n).fill(false);
-        this.obstacleConstrained = new Array(n).fill(false);
-        this.jointObstacles = Array.from({ length: n }, () => []);
+        return { joints, fMin: 0 };
     }
 
-    /**
-     * Build a chain directly from an explicit polyline — used for **frozen
-     * snippets** captured when a chain splits at a portal, and for rebuilding
-     * the active snippet from a known-good (collision-respecting) shape.
-     */
-    static fromPoints(
-        points: readonly Vec2[],
-        segmentLength: number,
-        linkSize: number,
-        color: string,
-    ): Chain {
-        const chain = Object.create(Chain.prototype) as Chain;
-        Object.assign(chain, {
-            segmentLength,
-            linkSize,
-            color,
-            joints: points.map((p) => ({ pos: p.clone(), oldPos: p.clone() })),
-            wasConstrained: new Array(points.length).fill(false),
-            obstacleConstrained: new Array(points.length).fill(false),
-            jointObstacles: Array.from({ length: points.length }, () => []),
-            chainObstacles: [],
-            dashPhase: 0,
-        });
-        return chain;
+    private active(): Span {
+        return this.spans[this.spans.length - 1];
     }
 
-    get length(): number {
-        return this.joints.length;
+    /** Joint count the active span gets for the rope left after the frozen fMins. */
+    private activeJointCount(): number {
+        const frozenMin = this.spans
+            .slice(0, -1)
+            .reduce((s, span) => s + span.fMin, 0);
+        const rope = Math.max(this.budget - frozenMin, this.segmentLength);
+        return Math.max(2, Math.round(rope / this.segmentLength) + 1);
     }
 
-    /** Current joint positions as a polyline, anchor → player order. */
-    pathPoints(): Vec2[] {
-        return this.joints.map((j) => j.pos.clone());
+    /** Grow the scratch arrays to cover the active span's joints. */
+    private resizeScratch(): void {
+        const n = this.active().joints.length;
+        while (this.wasConstrained.length < n) this.wasConstrained.push(false);
+        while (this.obstacleConstrained.length < n) this.obstacleConstrained.push(false);
+        while (this.jointObstacles.length < n) this.jointObstacles.push([]);
+        while (this.bucketOrigin.length < n) this.bucketOrigin.push(null);
     }
 
-    /** Current geometric path length (sum of segment distances). */
-    pathLength(): number {
+    private static spanLength(span: Span): number {
         let sum = 0;
-        for (let i = 1; i < this.joints.length; i++) {
-            sum += this.joints[i - 1].pos.distance(this.joints[i].pos);
+        for (let i = 1; i < span.joints.length; i++) {
+            sum += span.joints[i - 1].pos.distance(span.joints[i].pos);
         }
         return sum;
     }
 
-    /** Total maximum length of the chain. */
+    // ── Public state ─────────────────────────────────────────────────────────
+
+    /** Total rope budget. */
     maxLength(): number {
-        return this.segmentLength * (this.joints.length - 1);
+        return this.budget;
     }
 
-    /** Overwrite every joint (used to straighten frozen snippets). */
-    setJointPositions(points: readonly Vec2[]): void {
-        for (let i = 0; i < this.joints.length && i < points.length; i++) {
-            this.joints[i].pos = points[i].clone();
-            this.joints[i].oldPos = points[i].clone();
+    /** Pin the world anchor (only meaningful while un-split). */
+    setStart(anchor: Vec2): void {
+        if (this.spans.length === 1) {
+            const first = this.spans[0].joints[0];
+            first.pos = anchor.clone();
+            first.oldPos = anchor.clone();
         }
     }
 
-    setStart(pos: Vec2): void {
-        this.joints[0].pos = pos.clone();
-        this.joints[0].oldPos = pos.clone();
+    /** Pin the active span's player-side end. */
+    setEnd(playerPt: Vec2): void {
+        const joints = this.active().joints;
+        const last = joints[joints.length - 1];
+        last.pos = playerPt.clone();
+        last.oldPos = playerPt.clone();
     }
 
-    setEnd(pos: Vec2): void {
-        const last = this.joints[this.joints.length - 1];
-        last.pos = pos.clone();
-        last.oldPos = pos.clone();
-    }
-
-    start(): Vec2 {
-        return this.joints[0].pos;
-    }
-
-    /** True when every joint's frame displacement is below `threshold`. */
+    /** True when every active-span joint's frame displacement is tiny. */
     isStill(threshold: number): boolean {
         const tSq = threshold * threshold;
-        return this.joints.every((j) => j.pos.distanceSq(j.oldPos) < tSq);
+        return this.active().joints.every((j) => j.pos.distanceSq(j.oldPos) < tSq);
     }
 
-    /**
-     * Geometric stretch in [0, 1]: actual path length / max length. Reflects
-     * the real chain path, so a chain wrapped around an obstacle reads 1.0
-     * when fully extended.
-     */
+    /** Whole-rope stretch in [0, 1]: total path length across spans / budget. */
     stretch(): number {
-        return Math.min(1, Math.max(0, this.pathLength() / this.maxLength()));
+        const total = this.spans.reduce((s, span) => s + Chain.spanLength(span), 0);
+        return Math.min(1, Math.max(0, total / this.budget));
+    }
+
+    /** Each span's joint positions (used by the squeeze detection). */
+    spanPoints(): readonly Vec2[][] {
+        return this.spans.map((span) => span.joints.map((j) => j.pos));
     }
 
     /**
      * Tether point and remaining free length for the player constraint: the
-     * last obstacle-contact joint (walking back from the player end) and the
-     * rope left beyond it. With no contact it degenerates to the anchor and
-     * the full length. Call after `update`.
+     * last obstacle-contact joint of the active span (walking back from the
+     * player end) and the rope left beyond it. Call after `update`.
      */
-    playerTether(): { tether: Vec2; freeLength: number } {
-        const n = this.joints.length;
+    tether(): { tether: Vec2; freeLength: number } {
+        const joints = this.active().joints;
+        const n = joints.length;
         let contactIdx = 0;
         for (let i = n - 2; i >= 0; i--) {
             if (this.obstacleConstrained[i]) {
@@ -179,58 +195,113 @@ export class Chain {
             }
         }
         return {
-            tether: this.joints[contactIdx].pos,
+            tether: joints[contactIdx].pos,
             freeLength: (n - 1 - contactIdx) * this.segmentLength,
         };
     }
 
-    /** Every joint position — used by the squeeze detection. */
-    jointPositions(): readonly Vec2[] {
-        return this.joints.map((j) => j.pos);
-    }
+    // ── Portal crossings ─────────────────────────────────────────────────────
 
-    /** Move joint `i` swept against its per-frame obstacle list. */
-    private jointMove(i: number, from: Vec2, to: Vec2): { pos: Vec2; hit: boolean } {
-        const obstacles = this.jointObstacles[i];
-        return obstacles.length === 0 ? { pos: to, hit: false } : movePointSwept(from, to, obstacles);
-    }
+    /**
+     * Split at a portal: freeze the active span in place (player end snapped
+     * to `inCenter`) and start a fresh collapsed active span at `outCenter`.
+     */
+    split(inCenter: Vec2, outCenter: Vec2, playerPt: Vec2): void {
+        const span = this.active();
+        if (span.joints.length < 2) return;
+        const last = span.joints[span.joints.length - 1];
+        last.pos = inCenter.clone();
+        last.oldPos = inCenter.clone();
+        span.fMin = span.joints[0].pos.distance(inCenter);
 
-    /** AABB of every joint grown by `margin` (the once-per-chain broad phase). */
-    private jointsBounds(margin: number): Rect {
-        let min = this.joints[0].pos;
-        let max = this.joints[0].pos;
-        for (const j of this.joints) {
-            min = min.min(j.pos);
-            max = max.max(j.pos);
-        }
-        return new Rect(min.x - margin, min.y - margin, max.x - min.x + 2 * margin, max.y - min.y + 2 * margin);
+        this.spans.push(this.straightSpan(outCenter, playerPt, this.activeJointCount()));
+        this.resizeScratch();
+        this.clearContacts();
     }
 
     /**
-     * Advance the simulation. Both anchors must be pinned via `setStart` /
-     * `setEnd` first. `staticGrid` indexes the immovable world; `dynamics` are
-     * the few moving obstacles scanned linearly.
+     * Undo the most recent split (the player went back the same way): drop
+     * the collapsed far-side span and reabsorb the frozen one it came from.
+     *
+     * The rebuilt active span continues from the frozen span's **current
+     * shape** (resampled to the new joint budget) — never from a straight
+     * anchor→player line, which could cut through walls (the original game's
+     * main chain-through-wall vector).
      */
-    update(dt: number, staticGrid: ColliderGrid, dynamics: readonly Collider[]): void {
-        const n = this.joints.length;
+    merge(playerPt: Vec2): void {
+        if (this.spans.length < 2) return;
+        this.spans.pop(); // the collapsed active span on the far side
+        const reabsorbed = this.spans.pop()!;
+        reabsorbed.fMin = 0;
+
+        const shape = reabsorbed.joints.map((j) => j.pos);
+        shape.push(playerPt.clone());
+        const points = resamplePolyline(shape, this.activeJointCount());
+        this.spans.push({
+            joints: points.map((p) => ({ pos: p, oldPos: p.clone() })),
+            fMin: 0,
+        });
+        this.resizeScratch();
+        this.clearContacts();
+    }
+
+    private clearContacts(): void {
+        this.wasConstrained.fill(false);
+        this.obstacleConstrained.fill(false);
+        this.bucketOrigin.fill(null);
+    }
+
+    // ── Update ───────────────────────────────────────────────────────────────
+
+    /**
+     * Advance the rope one step: simulate the active span (unless
+     * `simulateActive` is false — the caller's stillness fast path), then
+     * tighten the frozen spans by however much rope the active span demands.
+     * Both phases share the same `staticGrid` + `dynamics` obstacle context.
+     */
+    update(
+        dt: number,
+        staticGrid: ColliderGrid,
+        dynamics: readonly Collider[],
+        simulateActive = true,
+    ): void {
+        this.dashPhase += dt * 14;
+        this.frameGrid = staticGrid;
+        this.frameDynamics = dynamics;
+        if (simulateActive) this.simulateActive(dt, staticGrid, dynamics);
+        this.applyPullthrough(staticGrid, dynamics);
+    }
+
+    // ── Active-span simulation ───────────────────────────────────────────────
+
+    private simulateActive(
+        dt: number,
+        staticGrid: ColliderGrid,
+        dynamics: readonly Collider[],
+    ): void {
+        const joints = this.active().joints;
+        const n = joints.length;
         if (n < 2) return;
 
-        this.dashPhase += dt * 14;
-
-        // ── Broad phase: one grid query per chain, filtered per joint ───────
+        // Broad phase: one grid query over the span's bounds, then a cheap
+        // per-joint filter into reusable buckets.
         const margin = this.segmentLength * 2 + 8;
+        this.bucketMargin = margin;
         this.chainObstacles.length = 0;
-        if (!staticGrid.isEmpty) staticGrid.query(this.jointsBounds(margin), this.chainObstacles);
+        if (!staticGrid.isEmpty) {
+            staticGrid.query(jointsBounds(joints, margin), this.chainObstacles);
+        }
         this.chainObstacles.push(...dynamics);
 
         for (let i = 1; i < n - 1; i++) {
             const bucket = this.jointObstacles[i];
             bucket.length = 0;
+            this.bucketOrigin[i] = joints[i].pos.clone();
             if (this.chainObstacles.length === 0) continue;
             const region = threePointBounds(
-                this.joints[i - 1].pos,
-                this.joints[i].pos,
-                this.joints[i + 1].pos,
+                joints[i - 1].pos,
+                joints[i].pos,
+                joints[i + 1].pos,
                 margin,
             );
             for (const c of this.chainObstacles) {
@@ -238,97 +309,92 @@ export class Chain {
             }
         }
 
-        // ── 0. Re-establish the "outside all obstacles" invariant ───────────
-        // Only a fresh spawn can violate it (all movement below is swept).
+        // 0. Re-establish the "outside all obstacles" invariant (only a fresh
+        // spawn can violate it — all movement below is swept).
         for (let i = 1; i < n - 1; i++) {
-            const unstuck = pushPointOutOf(this.joints[i].pos, this.jointObstacles[i]);
-            if (!unstuck.equals(this.joints[i].pos)) {
-                this.joints[i].pos = unstuck;
-                this.joints[i].oldPos = unstuck.clone();
+            const unstuck = pushPointOutOf(joints[i].pos, this.jointObstacles[i]);
+            if (!unstuck.equals(joints[i].pos)) {
+                joints[i].pos = unstuck;
+                joints[i].oldPos = unstuck.clone();
             }
         }
 
-        // ── 1. Residual Verlet inertia for slack joints (swept) ─────────────
+        // 1. Residual Verlet inertia for slack joints (swept).
         const retention = Math.pow(DAMPING, dt);
         for (let i = 1; i < n - 1; i++) {
-            const vel = this.joints[i].pos.sub(this.joints[i].oldPos).scale(retention);
-            const target = this.joints[i].pos.add(vel);
-            this.joints[i].oldPos = this.joints[i].pos;
-            this.joints[i].pos = this.jointMove(i, this.joints[i].pos, target).pos;
+            const vel = joints[i].pos.sub(joints[i].oldPos).scale(retention);
+            const target = joints[i].pos.add(vel);
+            joints[i].oldPos = joints[i].pos;
+            joints[i].pos = this.jointMove(i, joints[i].pos, target).pos;
         }
 
-        // ── 2. Bidirectional max-length constraints (swept) ─────────────────
+        // 2. Bidirectional max-length constraints (swept).
         this.wasConstrained.fill(false);
         this.obstacleConstrained.fill(false);
         for (let iter = 0; iter < CONSTRAINT_ITERATIONS; iter++) {
-            const maxMove = this.constraintPass(true);
-            if (maxMove < CONSTRAINT_EPS_SQ) break;
+            if (this.constraintPass(joints, true) < CONSTRAINT_EPS_SQ) break;
         }
 
-        // ── 3. Partial velocity retention ────────────────────────────────────
+        // 3. Partial velocity retention.
         for (let i = 1; i < n - 1; i++) {
             if (this.obstacleConstrained[i]) {
-                // Resting against a wall: no velocity, or it would try to move
-                // through the obstacle next frame.
-                this.joints[i].oldPos = this.joints[i].pos;
+                // Resting against a wall: drop all velocity, or the joint
+                // would try to move through the obstacle next frame.
+                joints[i].oldPos = joints[i].pos;
             } else if (this.wasConstrained[i]) {
-                const vel = this.joints[i].pos.sub(this.joints[i].oldPos);
-                this.joints[i].oldPos = this.joints[i].pos.sub(vel.scale(INERTIA_KEEP));
+                const vel = joints[i].pos.sub(joints[i].oldPos);
+                joints[i].oldPos = joints[i].pos.sub(vel.scale(INERTIA_KEEP));
             }
         }
 
-        // ── 4. Bend resistance (only while under tension) ────────────────────
-        const underTension = this.wasConstrained.some((c, i) => c && i > 0 && i < n - 1);
+        // 4. Bend resistance (only while under tension).
+        let underTension = false;
+        for (let i = 1; i < n - 1; i++) underTension ||= this.wasConstrained[i];
         const stretch = this.stretch();
         if (underTension && STRAIGHTNESS > 0 && stretch > 0.1) {
             const strength = STRAIGHTNESS * stretch * stretch;
             for (let iter = 0; iter < 8; iter++) {
                 let maxDeltaSq = 0;
                 for (let i = 1; i < n - 1; i++) {
-                    const ideal = this.joints[i - 1].pos.add(this.joints[i + 1].pos).scale(0.5);
-                    const current = this.joints[i].pos;
+                    const ideal = joints[i - 1].pos.add(joints[i + 1].pos).scale(0.5);
+                    const current = joints[i].pos;
                     const target = current.add(ideal.sub(current).scale(strength));
                     const moved = this.jointMove(i, current, target);
-                    this.joints[i].pos = moved.pos;
+                    joints[i].pos = moved.pos;
                     if (moved.hit) this.obstacleConstrained[i] = true;
                     maxDeltaSq = Math.max(maxDeltaSq, moved.pos.distanceSq(current));
                 }
                 if (maxDeltaSq < 0.01) break;
             }
-
-            // Re-enforce max length broken by straightening.
             for (let iter = 0; iter < 5; iter++) {
-                if (this.constraintPass(false) < CONSTRAINT_EPS_SQ) break;
+                if (this.constraintPass(joints, false) < CONSTRAINT_EPS_SQ) break;
             }
-
-            // Under tension the chain settles crisply: drop all velocity.
-            for (let i = 1; i < n - 1; i++) {
-                this.joints[i].oldPos = this.joints[i].pos;
-            }
+            // Under tension the rope settles crisply: drop all velocity.
+            for (let i = 1; i < n - 1; i++) joints[i].oldPos = joints[i].pos;
         }
     }
 
     /**
-     * One bidirectional distance-constraint sweep (player→anchor then
-     * anchor→player). Returns the squared magnitude of the largest correction.
-     * `markConstrained` also records tension for the inertia/bend phases.
+     * One bidirectional distance-constraint sweep over the active span
+     * (player→anchor then anchor→player). Returns the squared magnitude of
+     * the largest correction.
      */
-    private constraintPass(markConstrained: boolean): number {
-        const n = this.joints.length;
+    private constraintPass(joints: Joint[], markConstrained: boolean): number {
+        const n = joints.length;
         const sl = this.segmentLength;
         const slSq = sl * sl;
         let maxMoveSq = 0;
 
         const solve = (i: number, neighbourIdx: number) => {
-            const neighbour = this.joints[neighbourIdx].pos;
-            const delta = this.joints[i].pos.sub(neighbour);
+            const neighbour = joints[neighbourIdx].pos;
+            const delta = joints[i].pos.sub(neighbour);
             const distSq = delta.lengthSq();
             if (distSq <= slSq) return;
             const dist = Math.sqrt(distSq);
             const target = neighbour.add(delta.scale(sl / dist));
-            const oldPos = this.joints[i].pos;
+            const oldPos = joints[i].pos;
             const moved = this.jointMove(i, oldPos, target);
-            this.joints[i].pos = moved.pos;
+            joints[i].pos = moved.pos;
             maxMoveSq = Math.max(maxMoveSq, moved.pos.distanceSq(oldPos));
             if (markConstrained) this.wasConstrained[i] = true;
             if (moved.hit) this.obstacleConstrained[i] = true;
@@ -340,46 +406,166 @@ export class Chain {
     }
 
     /**
-     * Draw the chain as a clean layered rope: a dark outline, a coloured
-     * core, a thin highlight, and an animated dark dash pattern that reads as
-     * links crawling along the cable. Widths are in world pixels and kept
-     * slim; `alpha` lets the caller fade the whole rope.
+     * Move active-span joint `i` swept against its obstacle bucket.
+     *
+     * The bucket only covers a Chebyshev-`bucketMargin` neighbourhood of
+     * where the joint was when it was gathered. A long tension-propagation
+     * move (an end yank cascading down the rope) can leave that
+     * neighbourhood — the original engine kept using the stale bucket there,
+     * which is exactly how fast-moving chains passed through walls. When a
+     * move would exit the covered region, the bucket is re-gathered from the
+     * grid around the move first, so the sweep can never miss a wall.
+     */
+    private jointMove(i: number, from: Vec2, to: Vec2): { pos: Vec2; hit: boolean } {
+        const origin = this.bucketOrigin[i];
+        const m = this.bucketMargin - 1;
+        const covered =
+            origin !== null &&
+            Math.abs(from.x - origin.x) < m &&
+            Math.abs(from.y - origin.y) < m &&
+            Math.abs(to.x - origin.x) < m &&
+            Math.abs(to.y - origin.y) < m;
+        if (!covered) this.refreshBucket(i, from, to);
+
+        const obstacles = this.jointObstacles[i];
+        return obstacles.length === 0 ? { pos: to, hit: false } : movePointSwept(from, to, obstacles);
+    }
+
+    /** Re-gather joint `i`'s obstacle bucket around the move `from → to`. */
+    private refreshBucket(i: number, from: Vec2, to: Vec2): void {
+        const margin = this.bucketMargin;
+        const region = Rect.fromPoints(from, to).grow(margin);
+        const bucket = this.jointObstacles[i];
+        bucket.length = 0;
+        if (this.frameGrid && !this.frameGrid.isEmpty) this.frameGrid.query(region, bucket);
+        for (const c of this.frameDynamics) {
+            if (region.intersects(colliderBounds(c))) bucket.push(c);
+        }
+        // The new bucket covers `margin` around the move's midpoint.
+        this.bucketOrigin[i] = from.add(to).scale(0.5);
+    }
+
+    // ── Frozen-span tightening (portal pull-through) ─────────────────────────
+
+    /**
+     * Shrink the frozen spans by however much rope the active span currently
+     * demands, nearest-the-player first.
+     */
+    private applyPullthrough(staticGrid: ColliderGrid, dynamics: readonly Collider[]): void {
+        const frozenCount = this.spans.length - 1;
+        if (frozenCount === 0) return;
+        const lengths = this.spans.slice(0, -1).map((s) => Chain.spanLength(s));
+        const consumed = lengths.reduce((s, l) => s + l, 0);
+        const activePath = Chain.spanLength(this.active());
+        const slack = this.spans
+            .slice(0, -1)
+            .reduce((s, span, i) => s + Math.max(0, lengths[i] - span.fMin), 0);
+        let demand = Math.min(Math.max(activePath - (this.budget - consumed), 0), slack);
+
+        for (let idx = frozenCount - 1; idx >= 0 && demand > 0.25; idx--) {
+            const targetLen = Math.max(this.spans[idx].fMin, lengths[idx] - demand);
+            demand -= this.tightenSpan(this.spans[idx], targetLen, staticGrid, dynamics);
+        }
+    }
+
+    /**
+     * Shorten a frozen span toward `targetLen` by midpoint relaxation with
+     * swept joint moves (endpoints pinned). Obstacles include the dynamics —
+     * a span frozen around a squeezable stays wrapped around it. Returns the
+     * length actually given up (less when obstacles block tightening).
+     */
+    private tightenSpan(
+        span: Span,
+        targetLen: number,
+        staticGrid: ColliderGrid,
+        dynamics: readonly Collider[],
+    ): number {
+        const joints = span.joints;
+        const n = joints.length;
+        if (n < 3) return 0;
+        const before = Chain.spanLength(span);
+        if (before <= targetLen + 0.05) return 0;
+
+        const region = jointsBounds(joints, 8);
+        const obstacles: Collider[] = [];
+        if (!staticGrid.isEmpty) staticGrid.query(region, obstacles);
+        for (const c of dynamics) {
+            if (region.intersects(colliderBounds(c))) obstacles.push(c);
+        }
+
+        for (let iter = 0; iter < 24; iter++) {
+            let maxMoveSq = 0;
+            for (let i = 1; i < n - 1; i++) {
+                const mid = joints[i - 1].pos.add(joints[i + 1].pos).scale(0.5);
+                const target = joints[i].pos.lerp(mid, TIGHTEN_STRENGTH);
+                const moved =
+                    obstacles.length === 0
+                        ? target
+                        : movePointSwept(joints[i].pos, target, obstacles).pos;
+                maxMoveSq = Math.max(maxMoveSq, moved.distanceSq(joints[i].pos));
+                joints[i].pos = moved;
+                joints[i].oldPos = moved.clone();
+            }
+            if (Chain.spanLength(span) <= targetLen || maxMoveSq < 1e-4) break;
+        }
+        return before - Chain.spanLength(span);
+    }
+
+    // ── Drawing ──────────────────────────────────────────────────────────────
+
+    /**
+     * Draw every span as a clean layered rope: dark outline, coloured core,
+     * animated link dashes, thin highlight. Widths are in world pixels.
      */
     draw(ctx: CanvasRenderingContext2D, alpha: number): void {
-        const n = this.joints.length;
-        if (n < 2) return;
-
         ctx.save();
         ctx.globalAlpha *= alpha;
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
 
-        ctx.beginPath();
-        ctx.moveTo(this.joints[0].pos.x, this.joints[0].pos.y);
-        for (let i = 1; i < n; i++) ctx.lineTo(this.joints[i].pos.x, this.joints[i].pos.y);
+        for (const span of this.spans) {
+            const joints = span.joints;
+            if (joints.length < 2) continue;
 
-        // Outline → core → link dashes → highlight, all on the same path.
-        ctx.strokeStyle = 'rgb(8 8 14 / 60%)';
-        ctx.lineWidth = 3.2;
-        ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(joints[0].pos.x, joints[0].pos.y);
+            for (let i = 1; i < joints.length; i++) ctx.lineTo(joints[i].pos.x, joints[i].pos.y);
 
-        ctx.strokeStyle = this.color;
-        ctx.lineWidth = 2;
-        ctx.stroke();
+            ctx.strokeStyle = 'rgb(8 8 14 / 60%)';
+            ctx.lineWidth = 3.2;
+            ctx.stroke();
 
-        ctx.setLineDash([3, 2.2]);
-        ctx.lineDashOffset = -this.dashPhase;
-        ctx.strokeStyle = 'rgb(0 0 0 / 28%)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        ctx.setLineDash([]);
+            ctx.strokeStyle = this.color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
 
-        ctx.strokeStyle = 'rgb(255 255 255 / 30%)';
-        ctx.lineWidth = 0.7;
-        ctx.stroke();
+            ctx.setLineDash([3, 2.2]);
+            ctx.lineDashOffset = -this.dashPhase;
+            ctx.strokeStyle = 'rgb(0 0 0 / 28%)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.strokeStyle = 'rgb(255 255 255 / 30%)';
+            ctx.lineWidth = 0.7;
+            ctx.stroke();
+        }
 
         ctx.restore();
     }
+}
+
+// ── Geometry helpers ─────────────────────────────────────────────────────────
+
+/** AABB of a joint list grown by `margin` on every side. */
+function jointsBounds(joints: readonly Joint[], margin: number): Rect {
+    let min = joints[0].pos;
+    let max = joints[0].pos;
+    for (const j of joints) {
+        min = min.min(j.pos);
+        max = max.max(j.pos);
+    }
+    return new Rect(min.x - margin, min.y - margin, max.x - min.x + 2 * margin, max.y - min.y + 2 * margin);
 }
 
 /** AABB of three points, grown by `margin` on every side. */
@@ -387,4 +573,32 @@ function threePointBounds(a: Vec2, b: Vec2, c: Vec2, margin: number): Rect {
     const min = a.min(b).min(c);
     const max = a.max(b).max(c);
     return new Rect(min.x - margin, min.y - margin, max.x - min.x + 2 * margin, max.y - min.y + 2 * margin);
+}
+
+/**
+ * Resample a polyline to `count` points spaced evenly by arc length. The
+ * endpoints are preserved exactly.
+ */
+function resamplePolyline(points: readonly Vec2[], count: number): Vec2[] {
+    if (points.length === 1) return Array.from({ length: count }, () => points[0].clone());
+    let total = 0;
+    for (let i = 1; i < points.length; i++) total += points[i - 1].distance(points[i]);
+    if (total < 1e-6) return Array.from({ length: count }, () => points[0].clone());
+
+    const out: Vec2[] = [points[0].clone()];
+    let seg = 0;
+    let segStartDist = 0;
+    let segLen = points[0].distance(points[1]);
+    for (let i = 1; i < count - 1; i++) {
+        const target = (i / (count - 1)) * total;
+        while (segStartDist + segLen < target && seg < points.length - 2) {
+            segStartDist += segLen;
+            seg++;
+            segLen = points[seg].distance(points[seg + 1]);
+        }
+        const t = segLen > 1e-9 ? (target - segStartDist) / segLen : 0;
+        out.push(points[seg].lerp(points[seg + 1], t));
+    }
+    out.push(points[points.length - 1].clone());
+    return out;
 }
