@@ -1,7 +1,18 @@
 import { Camera2D } from '../engine/camera';
 import { Input } from '../engine/input';
 import { Circle, Rect, Vec2, clamp } from '../engine/math';
-import { LevelDocument, TAG_COLORS, chainAnchor, playerStart } from '../engine/level';
+import {
+    LevelAbilities,
+    LevelCollider,
+    LevelDocument,
+    LevelSprite,
+    RuleAction,
+    RuleEvent,
+    Shape,
+    TAG_COLORS,
+    playerStart,
+    shapeBounds,
+} from '../engine/level';
 import { GameTexture } from '../engine/textures';
 import { SpriteSheet } from '../engine/sprite-sheet';
 import {
@@ -15,8 +26,10 @@ import {
     resolveAabb,
 } from './collision';
 import {
+    ItemSpriteLink,
     MovableBox,
     barCollidersFrom,
+    itemSpriteLinksFrom,
     movableBoxesFrom,
     spawnItemSqueezables,
     staticCollidersFrom,
@@ -57,6 +70,21 @@ const CHAIN_COLOR = '#e8bd4a';
 
 /** Handle to a thing the player can push/pull. */
 type MovableRef = { kind: 'box'; index: number } | { kind: 'squeezable'; index: number };
+
+/** One live chain plus its authored identity (rules break chains by id). */
+interface ChainEntry {
+    id: string;
+    anchor: Vec2;
+    chain: Chain;
+}
+
+/** A plate or button zone with its live activation state. */
+interface TriggerZone {
+    id: string;
+    group?: string;
+    shape: Shape;
+    active: boolean;
+}
 
 function sameRef(a: MovableRef, b: MovableRef): boolean {
     return a.kind === b.kind && a.index === b.index;
@@ -127,17 +155,32 @@ export class World {
     readonly player: Player;
     private readonly level: LevelDocument;
     private readonly textures: Map<string, GameTexture>;
-    private readonly anchor: Vec2;
+    /** Pristine copies for reset: rules mutate colliders/abilities live. */
+    private readonly pristine: {
+        colliders: LevelCollider[];
+        sprites: LevelSprite[];
+        abilities: LevelAbilities;
+    };
 
-    private readonly staticColliders: Collider[];
-    private readonly barColliders: Collider[];
-    /** Statics + bars: the never-changing solid set, built once. */
-    private readonly immovableColliders: Collider[];
-    private readonly staticGrid: ColliderGrid;
-    private readonly boxes: MovableBox[];
+    private staticColliders: Collider[] = [];
+    private barColliders: Collider[] = [];
+    /** Statics + bars: the solid set (rebuilt when rules alter geometry). */
+    private immovableColliders: Collider[] = [];
+    private staticGrid: ColliderGrid = new ColliderGrid([]);
+    private boxes: MovableBox[] = [];
     private readonly playerStartPos: Vec2;
+    /** Sprites riding item colliders, index-aligned with the squeezables. */
+    private readonly itemSprites: ItemSpriteLink[];
+    /** sprite index → squeezable index, for hiding art of crushed items. */
+    private readonly spriteItem = new Map<number, number>();
 
-    private chains: Chain[] = [];
+    private chainEntries: ChainEntry[] = [];
+    private plates: TriggerZone[] = [];
+    private buttons: TriggerZone[] = [];
+    private firedRules = new Set<string>();
+    private portalAllowance = 0;
+    /** Seconds spent in the current run (shown in the HUD, saved on win). */
+    levelTime = 0;
     private portals: Portals;
     private portalsRestarting = false;
     private crossingExits: Circle[] = [];
@@ -174,47 +217,123 @@ export class World {
     constructor(private readonly assets: WorldAssets) {
         this.level = assets.level;
         this.textures = assets.textures;
-        this.anchor = chainAnchor(this.level);
+        this.pristine = {
+            colliders: structuredClone(this.level.colliders),
+            sprites: structuredClone(this.level.sprites),
+            abilities: { ...this.level.abilities },
+        };
 
-        this.staticColliders = staticCollidersFrom(this.level);
-        this.staticGrid = new ColliderGrid(this.staticColliders);
-        this.barColliders = barCollidersFrom(this.level);
-        this.immovableColliders = [...this.staticColliders, ...this.barColliders];
-        this.boxes = movableBoxesFrom(this.level, snapToGrid);
+        this.rebuildColliderWorld();
         this.playerStartPos = playerStart(this.level);
 
         this.player = new Player(assets.ducky);
         this.player.pos = this.playerStartPos.clone();
         this.prevPlayerPos = this.player.pos.clone();
+        this.applyAbilities(this.level.abilities);
 
         spawnItemSqueezables(this.level, this.squeezables);
+        this.itemSprites = itemSpriteLinksFrom(this.level);
+        this.itemSprites.forEach((link, item) => {
+            for (const { index } of link.sprites) this.spriteItem.set(index, item);
+        });
         this.squeezables.onSqueeze((ev) => {
             this.squeezeCount++;
             this.particles.burst(ev.pos, ['#f5008c', '#ff8fc8', '#ffd6ea'], 26, 150, 0.8);
         });
 
-        this.chains = this.newChains();
+        this.chainEntries = this.newChains();
         this.portals = new Portals(assets.portalPurple, assets.portalGreen);
     }
 
-    /** Build the chain tethering the player to the anchor. */
-    private newChains(): Chain[] {
-        const start = this.player.pos.add(this.player.chainOffset);
-        return [
-            new Chain(this.anchor, start, this.level.chainLength, CHAIN_LINK_SIZE, CHAIN_COLOR),
-        ];
+    /** The live chains (used wherever the identity doesn't matter). */
+    private get chains(): Chain[] {
+        return this.chainEntries.map((e) => e.chain);
     }
 
-    /** True when every squeezable has been crushed (the win condition). */
+    /** Build one chain per level chain definition, tethered to the player. */
+    private newChains(): ChainEntry[] {
+        const start = this.player.pos.add(this.player.chainOffset);
+        return this.level.chains.map((def) => {
+            const anchor = new Vec2(def.anchor.x, def.anchor.y);
+            return {
+                id: def.id,
+                anchor,
+                chain: new Chain(anchor, start, def.length, CHAIN_LINK_SIZE, CHAIN_COLOR),
+            };
+        });
+    }
+
+    private applyAbilities(abilities: LevelAbilities): void {
+        this.player.abilities.push = abilities.push;
+        this.player.abilities.pull = abilities.pull;
+        this.portalAllowance = abilities.portalPairs;
+    }
+
+    /**
+     * (Re)derive every collider-based structure from `level.colliders`. Runs
+     * at construction and again whenever a rule mutates the geometry
+     * (`setMovable` / `removeCollider`); box positions survive because
+     * `syncBoxShapesToLevel` writes them back into the shapes first.
+     */
+    private rebuildColliderWorld(): void {
+        this.staticColliders = staticCollidersFrom(this.level);
+        this.staticGrid = new ColliderGrid(this.staticColliders);
+        this.barColliders = barCollidersFrom(this.level);
+        this.immovableColliders = [...this.staticColliders, ...this.barColliders];
+        this.boxes = movableBoxesFrom(this.level, snapToGrid);
+        const zones = (tag: string): TriggerZone[] =>
+            this.level.colliders
+                .filter((c) => c.tag === tag)
+                .map((c) => ({ id: c.id, group: c.group, shape: c.shape, active: false }));
+        const prevButtons = new Map(this.buttons.map((b) => [b.id, b.active]));
+        this.plates = zones('plate');
+        this.buttons = zones('button');
+        // Buttons latch: a rebuild must not un-press them mid-run.
+        for (const b of this.buttons) b.active = prevButtons.get(b.id) ?? false;
+    }
+
+    /** Write the boxes' live positions back into their collider shapes. */
+    private syncBoxShapesToLevel(): void {
+        for (const box of this.boxes) {
+            const collider = this.level.colliders.find((c) => c.id === box.id);
+            if (collider && collider.shape.kind === 'rect') {
+                collider.shape.x = box.rect.x;
+                collider.shape.y = box.rect.y;
+            }
+        }
+    }
+
+    /** True when every squeezable has been crushed. */
     get allSqueezed(): boolean {
         return this.squeezables.totalCount > 0 && this.squeezables.aliveCount === 0;
     }
 
+    /** True while the player stands in the goal zone. */
+    get goalReached(): boolean {
+        const g = this.level.goal;
+        if (!g) return false;
+        return this.player.collider().intersects(new Rect(g.x, g.y, g.w, g.h));
+    }
+
+    /** The win condition: reach the goal if one exists, else squeeze all. */
+    get hasWon(): boolean {
+        return this.level.goal ? this.goalReached : this.allSqueezed;
+    }
+
     /** Reset world state for a fresh run. Reuses loaded assets and level. */
     reset(): void {
+        // Rules mutate colliders/abilities live; restore the pristine level.
+        this.level.colliders = structuredClone(this.pristine.colliders);
+        this.level.sprites = structuredClone(this.pristine.sprites);
+        this.level.abilities = { ...this.pristine.abilities };
+        this.firedRules.clear();
+        this.buttons = [];
+        this.rebuildColliderWorld();
+        this.applyAbilities(this.level.abilities);
+
         this.player.pos = this.playerStartPos.clone();
         this.player.velocity = new Vec2();
-        this.chains = this.newChains();
+        this.chainEntries = this.newChains();
         this.portals.startClosingAll();
         this.portalsRestarting = true;
         this.crossingExits = [];
@@ -222,19 +341,19 @@ export class World {
         this.guardDwell = 0;
         this.zoom = 3;
         this.targetZoom = 3;
+        this.levelTime = 0;
         this.squeezables.reviveAll();
         this.squeezeCount = 0;
         this.prevPlayerPos = this.player.pos.clone();
         this.playerStillFor = 0;
-        for (let i = 0; i < this.boxes.length; i++) {
-            this.moveBox(i, this.boxes[i].origin.sub(this.boxes[i].rect.position()));
-        }
+        this.syncItemSprites();
     }
 
     /** Advance the world one fixed step. Pausing simply stops calling this. */
     update(input: Input, dt: number): void {
         if (input.wasPressed('F3')) this.debugCollisions = !this.debugCollisions;
         this.time += dt;
+        this.levelTime += dt;
 
         // Smooth zoom: the wheel moves a *target* (multiplicatively, so a
         // notch feels the same at every zoom level) and the camera eases
@@ -259,9 +378,13 @@ export class World {
             this.portals = new Portals(this.assets.portalPurple, this.assets.portalGreen);
             this.portalsRestarting = false;
         }
+        // Portal placement, limited to the level's (rule-adjustable) pair
+        // allowance; completing a pending pair is always allowed.
         if (!this.portalsRestarting && input.wasPressed('Space')) {
-            this.portals.place(this.player.chainPoint());
-            this.particles.burst(this.player.chainPoint(), ['#c39bff', '#fff'], 14, 90, 0.5);
+            if (this.portals.hasPending || this.portals.pairCount < this.portalAllowance) {
+                this.portals.place(this.player.chainPoint());
+                this.particles.burst(this.player.chainPoint(), ['#c39bff', '#fff'], 14, 90, 0.5);
+            }
         }
 
         // Ambient sparkles drifting off the idle portal rings.
@@ -303,6 +426,134 @@ export class World {
 
         // Crush anything a chain has cinched tight.
         this.squeezables.update(this.chains);
+        this.syncItemSprites();
+
+        // Triggers + causality: refresh plate/button states, then fire any
+        // rule whose condition just became true.
+        this.updateTriggers();
+        this.evaluateRules();
+    }
+
+    // ── Triggers + rules ─────────────────────────────────────────────────────
+
+    private static pointInShape(p: Vec2, shape: Shape): boolean {
+        if (shape.kind === 'rect') return shapeBounds(shape).containsPoint(p);
+        return p.distanceSq(new Vec2(shape.x, shape.y)) <= shape.r * shape.r;
+    }
+
+    /**
+     * Plates are *held*: active only while some chain joint lies over them.
+     * Buttons *latch*: once the player steps on one it stays pressed.
+     */
+    private updateTriggers(): void {
+        for (const plate of this.plates) {
+            const wasActive = plate.active;
+            plate.active = this.chainEntries.some((e) =>
+                e.chain
+                    .spanPoints()
+                    .some((pts) => pts.some((p) => World.pointInShape(p, plate.shape))),
+            );
+            if (plate.active && !wasActive) {
+                const b = shapeBounds(plate.shape);
+                this.particles.burst(b.center(), ['#2fd6ad', '#b8fff0'], 10, 70, 0.4);
+            }
+        }
+        const playerRect = this.player.collider();
+        for (const button of this.buttons) {
+            if (button.active) continue;
+            if (playerRect.intersects(shapeBounds(button.shape))) {
+                button.active = true;
+                this.particles.burst(shapeBounds(button.shape).center(), ['#ff5555', '#ffd0d0'], 12, 80, 0.5);
+            }
+        }
+    }
+
+    /** Do all zones matching `target` (an id or group name) satisfy it? */
+    private static zonesSatisfied(zones: TriggerZone[], target: string): boolean {
+        const matched = zones.filter((z) => z.id === target || z.group === target);
+        return matched.length > 0 && matched.every((z) => z.active);
+    }
+
+    private ruleConditionMet(when: RuleEvent): boolean {
+        switch (when.type) {
+            case 'buttonPressed':
+                return World.zonesSatisfied(this.buttons, when.target);
+            case 'plateActive':
+                return World.zonesSatisfied(this.plates, when.target);
+            case 'squeezed':
+                return this.squeezables.allSqueezedFor(when.target);
+        }
+    }
+
+    /** Fire (once each) every rule whose condition currently holds. */
+    private evaluateRules(): void {
+        for (const rule of this.level.rules) {
+            if (this.firedRules.has(rule.id)) continue;
+            if (!this.ruleConditionMet(rule.when)) continue;
+            this.firedRules.add(rule.id);
+            for (const action of rule.actions) this.applyRuleAction(action);
+        }
+    }
+
+    private applyRuleAction(action: RuleAction): void {
+        switch (action.type) {
+            case 'breakChain': {
+                const idx = this.chainEntries.findIndex((e) => e.id === action.chainId);
+                if (idx < 0) break;
+                const entry = this.chainEntries[idx];
+                // The rope shatters: sparks along its final shape.
+                for (const pts of entry.chain.spanPoints()) {
+                    for (let i = 0; i < pts.length; i += 12) {
+                        this.particles.burst(pts[i], ['#e8bd4a', '#fff2c8'], 4, 60, 0.6);
+                    }
+                }
+                this.chainEntries.splice(idx, 1);
+                break;
+            }
+            case 'setAbility':
+                this.player.abilities[action.ability] = action.value;
+                break;
+            case 'addPortalPairs':
+                this.portalAllowance = Math.max(0, this.portalAllowance + action.amount);
+                break;
+            case 'setMovable': {
+                const collider = this.level.colliders.find((c) => c.id === action.colliderId);
+                if (!collider) break;
+                this.syncBoxShapesToLevel();
+                collider.tag = action.movable ? 'movable' : 'wall';
+                this.rebuildColliderWorld();
+                break;
+            }
+            case 'removeCollider': {
+                const idx = this.level.colliders.findIndex((c) => c.id === action.colliderId);
+                if (idx < 0) break;
+                const b = shapeBounds(this.level.colliders[idx].shape);
+                this.particles.burst(b.center(), ['#9aa4bd', '#fff'], 20, 120, 0.7);
+                this.syncBoxShapesToLevel();
+                this.level.colliders.splice(idx, 1);
+                this.rebuildColliderWorld();
+                break;
+            }
+        }
+    }
+
+    /** Keep sprites riding item colliders glued to their squeezable. */
+    private syncItemSprites(): void {
+        for (let item = 0; item < this.itemSprites.length; item++) {
+            const link = this.itemSprites[item];
+            if (link.sprites.length === 0 || !this.squeezables.isAlive(item)) continue;
+            const center = this.squeezables.centerOf(item);
+            for (const { index, offset } of link.sprites) {
+                this.level.sprites[index].x = center.x + offset.x;
+                this.level.sprites[index].y = center.y + offset.y;
+            }
+        }
+    }
+
+    /** True for sprites whose linked squeezable has been crushed. */
+    private spriteHidden(i: number): boolean {
+        const item = this.spriteItem.get(i);
+        return item !== undefined && !this.squeezables.isAlive(item);
     }
 
     // ── Collider set management ──────────────────────────────────────────────
@@ -575,8 +826,8 @@ export class World {
         for (const b of this.boxes) this.dynamicColliders.push(aabb(b.rect));
         this.squeezables.extendColliders(this.dynamicColliders);
 
-        for (const chain of this.chains) {
-            chain.setStart(this.anchor);
+        for (const { anchor, chain } of this.chainEntries) {
+            chain.setStart(anchor);
             chain.setEnd(end);
             // When everything is still, skip the active-span simulation (the
             // pull-through tightening still runs — it's demand-driven).
@@ -615,6 +866,19 @@ export class World {
         const found = this.portals.findEntry(pt, this.crossingGuard);
         if (!found) return;
         const { entry, exit } = found;
+
+        // A pair the chain is already threaded through is *locked*: the only
+        // allowed crossing is going back the way we came (the merge below).
+        // Anything else would double-thread the pair, so the portal simply
+        // refuses — the player walks over it like normal ground.
+        const lastExit = this.crossingExits[this.crossingExits.length - 1];
+        const isMergeBack = !!lastExit && lastExit.equals(entry);
+        if (!isMergeBack && this.chainEntries.length > 0) {
+            const threaded = this.crossingExits.some(
+                (c) => this.portals.pairIndexOf(c) === found.pairIndex,
+            );
+            if (threaded) return;
+        }
 
         // Teleport, keeping the centre-to-corner offset.
         this.player.pos = exit.center.sub(this.player.chainOffset);
@@ -691,11 +955,20 @@ export class World {
         // lies on the ground, so Y-sorted entities draw *over* it.
         this.drawGeometry(ctx, view);
         this.drawBackgroundSprites(ctx, view);
-        for (const chain of this.chains) chain.draw(ctx, 1);
-        ctx.fillStyle = '#ffcb00';
-        ctx.beginPath();
-        ctx.arc(this.anchor.x, this.anchor.y, 6, 0, Math.PI * 2);
-        ctx.fill();
+        this.drawGoal(ctx);
+
+        // Longest rope first so the smallest chain draws last, on top —
+        // it's the tightest constraint, so it should be the most visible.
+        const byLength = [...this.chainEntries].sort(
+            (a, b) => b.chain.maxLength() - a.chain.maxLength(),
+        );
+        for (const { chain } of byLength) chain.draw(ctx, 1);
+        for (const { anchor } of this.chainEntries) {
+            ctx.fillStyle = '#ffcb00';
+            ctx.beginPath();
+            ctx.arc(anchor.x, anchor.y, 6, 0, Math.PI * 2);
+            ctx.fill();
+        }
         this.portals.draw(ctx);
 
         // Soft contact shadows under the dynamic entities, above the floor
@@ -732,8 +1005,13 @@ export class World {
      * physics rects with a crate look.
      */
     private drawGeometry(ctx: CanvasRenderingContext2D, view: Rect): void {
-        for (const { tag, shape } of this.level.colliders) {
+        for (const collider of this.level.colliders) {
+            const { tag, shape } = collider;
             if (tag === 'movable' || tag === 'item') continue; // live entities
+            if (tag === 'plate' || tag === 'button') {
+                this.drawTrigger(ctx, collider);
+                continue;
+            }
             const bounds =
                 shape.kind === 'rect'
                     ? new Rect(shape.x, shape.y, shape.w, shape.h)
@@ -808,6 +1086,70 @@ export class World {
         ctx.stroke();
     }
 
+    /** Pressure plates and buttons: floor decals with a live "on" state. */
+    private drawTrigger(ctx: CanvasRenderingContext2D, collider: LevelCollider): void {
+        const isPlate = collider.tag === 'plate';
+        const zones = isPlate ? this.plates : this.buttons;
+        const active = zones.find((z) => z.id === collider.id)?.active ?? false;
+        const bounds = shapeBounds(collider.shape);
+        const base = TAG_COLORS[collider.tag];
+
+        if (isPlate) {
+            // A recessed plate: dark bed, glowing surface when held.
+            ctx.fillStyle = '#101722';
+            ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+            const inset = 3;
+            const pulse = active ? 0.55 + 0.25 * Math.sin(this.time * 6) : 0.18;
+            ctx.save();
+            ctx.globalAlpha *= pulse;
+            ctx.fillStyle = base;
+            ctx.fillRect(
+                bounds.x + inset,
+                bounds.y + inset,
+                bounds.width - inset * 2,
+                bounds.height - inset * 2,
+            );
+            ctx.restore();
+            ctx.strokeStyle = base;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(bounds.x + 1, bounds.y + 1, bounds.width - 2, bounds.height - 2);
+        } else {
+            // A round button cap; pressed caps sink and darken.
+            const c = bounds.center();
+            const r = Math.min(bounds.width, bounds.height) / 2;
+            ctx.fillStyle = '#3a1620';
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = active ? '#7c2f2f' : base;
+            ctx.beginPath();
+            ctx.arc(c.x, c.y - (active ? 0 : 2), r * 0.72, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    /** The goal zone: a pulsing golden pad the duck must reach. */
+    private drawGoal(ctx: CanvasRenderingContext2D): void {
+        const g = this.level.goal;
+        if (!g) return;
+        const cx = g.x + g.w / 2;
+        const cy = g.y + g.h / 2;
+        ctx.save();
+        ctx.fillStyle = 'rgb(232 189 74 / 14%)';
+        ctx.fillRect(g.x, g.y, g.w, g.h);
+        ctx.strokeStyle = '#e8bd4a';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(g.x, g.y, g.w, g.h);
+        // Expanding ring pulse.
+        const t = (this.time % 1.4) / 1.4;
+        const r = (Math.min(g.w, g.h) / 2) * (0.3 + 0.6 * t);
+        ctx.globalAlpha *= 1 - t;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+    }
+
     private spriteVisible(i: number, view: Rect): boolean {
         const sprite = this.level.sprites[i];
         const tex = this.textures.get(sprite.assetId);
@@ -824,7 +1166,11 @@ export class World {
     private drawBackgroundSprites(ctx: CanvasRenderingContext2D, view: Rect): void {
         const sprites = this.level.sprites;
         for (let i = 0; i < sprites.length; i++) {
-            if (sprites[i].layer === 'background' && this.spriteVisible(i, view)) {
+            if (
+                sprites[i].layer === 'background' &&
+                !this.spriteHidden(i) &&
+                this.spriteVisible(i, view)
+            ) {
                 this.drawSprite(ctx, i);
             }
         }
@@ -843,7 +1189,8 @@ export class World {
         const small: number[] = [];
         for (let i = 0; i < sprites.length; i++) {
             const sprite = sprites[i];
-            if (sprite.layer === 'background' || !this.spriteVisible(i, view)) continue;
+            if (sprite.layer === 'background' || this.spriteHidden(i)) continue;
+            if (!this.spriteVisible(i, view)) continue;
             const tex = this.textures.get(sprite.assetId);
             const w = tex ? tex.width * sprite.scale : 0;
             const h = tex ? tex.height * sprite.scale : 0;
@@ -861,6 +1208,8 @@ export class World {
             draw: () => this.player.draw(ctx),
         });
         for (const { index, center, radius } of this.squeezables.eachAlive()) {
+            // Items with linked artwork are drawn by their sprites instead.
+            if (this.itemSprites[index]?.sprites.length) continue;
             order.push({
                 y: center.y + radius,
                 draw: () => this.squeezables.drawItem(ctx, index),
@@ -896,7 +1245,7 @@ export class World {
     /** Debug overlay: collision shapes, movable boxes, player collider. */
     private drawDebug(ctx: CanvasRenderingContext2D): void {
         for (const { tag, shape } of this.level.colliders) {
-            if (tag === 'movable') continue;
+            if (tag === 'movable' || tag === 'plate' || tag === 'button') continue;
             ctx.fillStyle = 'rgba(200 60 60 / 40%)';
             if (shape.kind === 'rect') {
                 ctx.fillRect(shape.x, shape.y, shape.w, shape.h);

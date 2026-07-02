@@ -12,7 +12,7 @@ import { Rect, Vec2 } from './math';
  */
 
 export const LEVEL_FORMAT = 'duckinboots.level';
-export const LEVEL_VERSION = 2;
+export const LEVEL_VERSION = 3;
 
 /** What a collider *is* in gameplay terms. */
 export type ColliderTag =
@@ -20,7 +20,9 @@ export type ColliderTag =
     | 'movable' /* pushable/pullable box */
     | 'item' /* chain-crushable squeezable */
     | 'bar' /* solid to the player, transparent to the chain */
-    | 'water'; /* solid; rendered as water */
+    | 'water' /* solid; rendered as water */
+    | 'plate' /* non-solid; active while a chain lies over it */
+    | 'button'; /* non-solid; latches pressed when the player steps on it */
 
 export interface RectShape {
     kind: 'rect';
@@ -43,6 +45,53 @@ export interface LevelCollider {
     id: string;
     tag: ColliderTag;
     shape: Shape;
+    /**
+     * Trigger/squeeze group. Grouped `item`s must all be cinched in the same
+     * frame to be crushed; a grouped `plate` event fires only when every
+     * plate in the group is held at once. Rules can target a group name.
+     */
+    group?: string;
+}
+
+/** One chain tethering the player, with its own anchor and rope length. */
+export interface LevelChain {
+    id: string;
+    anchor: { x: number; y: number };
+    length: number;
+}
+
+/** The player's starting toolkit; rules can change these mid-level. */
+export interface LevelAbilities {
+    push: boolean;
+    pull: boolean;
+    /** Max portal pairs the player may have open at once (0 = none). */
+    portalPairs: number;
+}
+
+export type RuleEventType = 'buttonPressed' | 'plateActive' | 'squeezed';
+
+/** The condition side of a rule: an event on a collider id or group name. */
+export interface RuleEvent {
+    type: RuleEventType;
+    /** A collider id, or a group name (matches every collider in the group). */
+    target: string;
+}
+
+export type RuleAction =
+    | { type: 'breakChain'; chainId: string }
+    | { type: 'setAbility'; ability: 'push' | 'pull'; value: boolean }
+    | { type: 'addPortalPairs'; amount: number }
+    | { type: 'setMovable'; colliderId: string; movable: boolean }
+    | { type: 'removeCollider'; colliderId: string };
+
+/**
+ * Causality: when the event's condition becomes true, the actions run once
+ * (rules are latched — they never fire twice in a run; reset re-arms them).
+ */
+export interface LevelRule {
+    id: string;
+    when: RuleEvent;
+    actions: RuleAction[];
 }
 
 /**
@@ -81,9 +130,12 @@ export interface LevelDocument {
     /** Editor snap grid, world px. */
     gridSize: number;
     playerStart: { x: number; y: number };
-    chainAnchor: { x: number; y: number };
-    /** Total rope length of the player's chain. */
-    chainLength: number;
+    /** Every chain tethering the player (may be empty: a free duck). */
+    chains: LevelChain[];
+    /** Where the duck must go to win. `null` = win by squeezing everything. */
+    goal: { x: number; y: number; w: number; h: number } | null;
+    abilities: LevelAbilities;
+    rules: LevelRule[];
     colliders: LevelCollider[];
     assets: LevelAsset[];
     sprites: LevelSprite[];
@@ -96,6 +148,8 @@ export const TAG_COLORS: Record<ColliderTag, string> = {
     item: '#f5008c',
     bar: '#ff8a2a',
     water: '#3fa3ff',
+    plate: '#2fd6ad',
+    button: '#ff5555',
 };
 
 /** Human labels for the editor UI. */
@@ -105,9 +159,19 @@ export const TAG_LABELS: Record<ColliderTag, string> = {
     item: 'Item',
     bar: 'Bar',
     water: 'Water',
+    plate: 'Plate',
+    button: 'Button',
 };
 
-export const ALL_TAGS: ColliderTag[] = ['wall', 'movable', 'item', 'bar', 'water'];
+export const ALL_TAGS: ColliderTag[] = [
+    'wall',
+    'movable',
+    'item',
+    'bar',
+    'water',
+    'plate',
+    'button',
+];
 
 /** Short, collision-safe id for level objects. */
 export function newId(): string {
@@ -127,8 +191,10 @@ export function createEmptyLevel(name = 'Untitled level'): LevelDocument {
         updatedAt: now,
         gridSize: 32,
         playerStart: { x: 0, y: 0 },
-        chainAnchor: { x: 0, y: -96 },
-        chainLength: 1600,
+        chains: [{ id: newId(), anchor: { x: 0, y: -96 }, length: 1600 }],
+        goal: null,
+        abilities: { push: true, pull: true, portalPairs: 99 },
+        rules: [],
         colliders: [],
         assets: [],
         sprites: [],
@@ -147,10 +213,6 @@ export function shapeBounds(shape: Shape): Rect {
 
 export function playerStart(level: LevelDocument): Vec2 {
     return new Vec2(level.playerStart.x, level.playerStart.y);
-}
-
-export function chainAnchor(level: LevelDocument): Vec2 {
-    return new Vec2(level.chainAnchor.x, level.chainAnchor.y);
 }
 
 /**
@@ -177,16 +239,20 @@ export function normalizeLevel(raw: unknown): LevelDocument {
             | { kind?: unknown; x?: unknown; y?: unknown; w?: unknown; h?: unknown; r?: unknown }
             | undefined;
         if (!shape || !col.tag || !ALL_TAGS.includes(col.tag)) continue;
+        const group =
+            typeof col.group === 'string' && col.group.trim() ? col.group.trim() : undefined;
         if (shape.kind === 'rect') {
             colliders.push({
                 id: col.id || newId(),
                 tag: col.tag,
+                group,
                 shape: { kind: 'rect', x: num(shape.x, 0), y: num(shape.y, 0), w: num(shape.w, 32), h: num(shape.h, 32) },
             });
         } else if (shape.kind === 'circle') {
             colliders.push({
                 id: col.id || newId(),
                 tag: col.tag,
+                group,
                 shape: { kind: 'circle', x: num(shape.x, 0), y: num(shape.y, 0), r: num(shape.r, 16) },
             });
         }
@@ -223,6 +289,82 @@ export function normalizeLevel(raw: unknown): LevelDocument {
         });
     }
 
+    // Chains: current array form, migrating older single-chain documents
+    // (`chainAnchor` + `chainLength`) into a one-entry list.
+    const chains: LevelChain[] = [];
+    if (Array.isArray(doc.chains)) {
+        for (const c of doc.chains) {
+            const chain = c as Partial<LevelChain>;
+            chains.push({
+                id: chain.id || newId(),
+                anchor: point(chain.anchor, 0, -96),
+                length: Math.max(100, num(chain.length, 1600)),
+            });
+        }
+    } else if ('chainAnchor' in doc) {
+        chains.push({
+            id: newId(),
+            anchor: point(doc['chainAnchor'], 0, -96),
+            length: Math.max(100, num(doc['chainLength'], 1600)),
+        });
+    }
+    const chainIds = new Set(chains.map((c) => c.id));
+
+    const goalRaw = doc.goal as { x?: unknown; y?: unknown; w?: unknown; h?: unknown } | null;
+    const goal =
+        goalRaw && typeof goalRaw === 'object'
+            ? {
+                  x: num(goalRaw.x, 0),
+                  y: num(goalRaw.y, 0),
+                  w: Math.max(8, num(goalRaw.w, 64)),
+                  h: Math.max(8, num(goalRaw.h, 64)),
+              }
+            : null;
+
+    const abilitiesRaw = (doc.abilities ?? {}) as Partial<LevelAbilities>;
+    const abilities: LevelAbilities = {
+        push: abilitiesRaw.push !== false,
+        pull: abilitiesRaw.pull !== false,
+        portalPairs: Math.max(0, num(abilitiesRaw.portalPairs, 99)),
+    };
+
+    const rules: LevelRule[] = [];
+    for (const r of Array.isArray(doc.rules) ? doc.rules : []) {
+        const rule = r as Partial<LevelRule>;
+        const when = rule.when as Partial<RuleEvent> | undefined;
+        if (
+            !when ||
+            !['buttonPressed', 'plateActive', 'squeezed'].includes(when.type as string) ||
+            typeof when.target !== 'string'
+        ) {
+            continue;
+        }
+        const actions: RuleAction[] = [];
+        for (const a of Array.isArray(rule.actions) ? rule.actions : []) {
+            const action = a as RuleAction;
+            switch (action.type) {
+                case 'breakChain':
+                    if (chainIds.has(action.chainId)) actions.push(action);
+                    break;
+                case 'setAbility':
+                    if (action.ability === 'push' || action.ability === 'pull') {
+                        actions.push({ ...action, value: action.value !== false });
+                    }
+                    break;
+                case 'addPortalPairs':
+                    actions.push({ type: 'addPortalPairs', amount: num(action.amount, 1) });
+                    break;
+                case 'setMovable':
+                case 'removeCollider':
+                    if (colliders.some((c) => c.id === action.colliderId)) actions.push(action);
+                    break;
+            }
+        }
+        if (actions.length > 0) {
+            rules.push({ id: rule.id || newId(), when: { type: when.type as RuleEventType, target: when.target }, actions });
+        }
+    }
+
     const now = new Date().toISOString();
     return {
         format: LEVEL_FORMAT,
@@ -233,8 +375,10 @@ export function normalizeLevel(raw: unknown): LevelDocument {
         updatedAt: typeof doc.updatedAt === 'string' ? doc.updatedAt : now,
         gridSize: Math.max(1, num(doc.gridSize, 32)),
         playerStart: point(doc.playerStart, 0, 0),
-        chainAnchor: point(doc.chainAnchor, 0, -96),
-        chainLength: Math.max(100, num(doc.chainLength, 1600)),
+        chains,
+        goal,
+        abilities,
+        rules,
         colliders,
         assets,
         sprites,

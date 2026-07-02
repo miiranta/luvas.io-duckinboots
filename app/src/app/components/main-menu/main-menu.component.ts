@@ -3,6 +3,7 @@ import { GameService } from '../../services/game.service';
 import { LevelStoreService, LevelSummary } from '../../services/level-store.service';
 import { I18nService } from '../../services/i18n.service';
 import { Lang } from '../../i18n/translations';
+import { formatDuration } from '../../util/time';
 
 type MenuScreen = 'main' | 'levels' | 'instructions' | 'credits' | 'language';
 
@@ -31,6 +32,7 @@ export class MainMenuComponent {
     protected readonly selected = signal(0);
     protected readonly credits = CREDITS;
     protected readonly levels = signal<LevelSummary[] | null>(null);
+    protected readonly formatDuration = formatDuration;
 
     /** Decorative duck rain, randomized once per menu visit. */
     protected readonly ducks: FallingDuck[] = Array.from({ length: 18 }, () => ({

@@ -77,11 +77,23 @@ export class Portals {
     private pairs: PortalPair[] = [];
     /** First circle of a pair, placed but not yet paired. */
     private pending: PortalInstance | null = null;
+    /** Monotonic colour cursor so a new pair never reuses a live pair's colour. */
+    private nextColor = 0;
 
     constructor(
         private readonly purpleSheet: SpriteSheet,
         private readonly greenSheet: SpriteSheet,
     ) {}
+
+    /** Completed pairs currently open (closing ones still count until gone). */
+    get pairCount(): number {
+        return this.pairs.length;
+    }
+
+    /** True while a first portal is placed and waiting for its partner. */
+    get hasPending(): boolean {
+        return this.pending !== null;
+    }
 
     /**
      * Place a portal at `center`. The first placement is held pending; the
@@ -95,7 +107,7 @@ export class Portals {
         if (!this.pending) {
             this.pending = instance;
         } else {
-            const color = PAIR_COLORS[this.pairs.length % PAIR_COLORS.length];
+            const color = PAIR_COLORS[this.nextColor++ % PAIR_COLORS.length];
             this.pairs.push({ a: this.pending, b: instance, color });
             this.pending = null;
         }
@@ -147,11 +159,16 @@ export class Portals {
 
     /**
      * If `point` is inside some portal circle (other than `exclude`, the one
-     * the player just exited), return the entry circle and its partner.
-     * Closing portals are ignored.
+     * the player just exited), return the entry circle, its partner, and the
+     * pair's index (for threaded-pair bookkeeping). Closing portals are
+     * ignored.
      */
-    findEntry(point: Vec2, exclude: Circle | null): { entry: Circle; exit: Circle } | null {
-        for (const pair of this.pairs) {
+    findEntry(
+        point: Vec2,
+        exclude: Circle | null,
+    ): { entry: Circle; exit: Circle; pairIndex: number } | null {
+        for (let pairIndex = 0; pairIndex < this.pairs.length; pairIndex++) {
+            const pair = this.pairs[pairIndex];
             const combos: [PortalInstance, PortalInstance][] = [
                 [pair.a, pair.b],
                 [pair.b, pair.a],
@@ -160,25 +177,55 @@ export class Portals {
                 if (entry.state === 'closing') continue;
                 if (exclude && entry.circle.equals(exclude)) continue;
                 if (entry.circle.containsPoint(point)) {
-                    return { entry: entry.circle, exit: exit.circle };
+                    return { entry: entry.circle, exit: exit.circle, pairIndex };
                 }
             }
         }
         return null;
     }
 
+    /** The index of the pair a circle belongs to, or -1. */
+    pairIndexOf(circle: Circle): number {
+        return this.pairs.findIndex(
+            (p) => p.a.circle.equals(circle) || p.b.circle.equals(circle),
+        );
+    }
+
     draw(ctx: CanvasRenderingContext2D): void {
         for (const pair of this.pairs) {
             drawInstance(ctx, pair.a);
             drawInstance(ctx, pair.b);
+            // Matching rings make it obvious which two portals belong
+            // together — both circles of a pair wear the same colour.
+            drawPairRing(ctx, pair.a, pair.color);
+            drawPairRing(ctx, pair.b, pair.color);
             drawPairBall(ctx, pair.a.circle.center, pair.color);
             drawPairBall(ctx, pair.b.circle.center, pair.color);
         }
         if (this.pending) {
             drawInstance(ctx, this.pending);
+            drawPairRing(ctx, this.pending, '#c8c8c8');
             drawPairBall(ctx, this.pending.circle.center, '#c8c8c8');
         }
     }
+}
+
+/** A coloured ring around the portal mouth identifying its pair. */
+function drawPairRing(ctx: CanvasRenderingContext2D, instance: PortalInstance, color: string): void {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha *= instance.state === 'closing' ? 0.35 : 0.85;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(
+        instance.circle.center.x,
+        instance.circle.center.y,
+        instance.circle.radius + 3,
+        0,
+        Math.PI * 2,
+    );
+    ctx.stroke();
+    ctx.restore();
 }
 
 function drawInstance(ctx: CanvasRenderingContext2D, instance: PortalInstance): void {

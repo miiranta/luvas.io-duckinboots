@@ -1,4 +1,5 @@
-import { Injectable, computed, signal } from '@angular/core';
+import { Injectable, computed, inject, signal } from '@angular/core';
+import { LevelStoreService } from './level-store.service';
 import { GameLoop } from '../../engine/loop';
 import { Input } from '../../engine/input';
 import { loadImage } from '../../engine/assets';
@@ -39,6 +40,8 @@ export class GameService {
     readonly squeezed = signal(0);
     readonly squeezeTotal = signal(0);
     readonly fps = signal(0);
+    /** Seconds spent in the current run (HUD timer / win screen). */
+    readonly levelTime = signal(0);
     /** User toggle for the shader effects (F4). */
     readonly shadersEnabled = signal(true);
     /** Whether WebGPU post-processing is available on this device. */
@@ -48,8 +51,11 @@ export class GameService {
         () => this.shadersSupported() && this.shadersEnabled() && this.inWorld(),
     );
     private readonly inWorld = signal(false);
+    private readonly store = inject(LevelStoreService);
 
     private core?: CoreAssets;
+    /** Id of the level being played, for progress recording. */
+    private playingLevelId: string | null = null;
     private world?: World;
     private loop?: GameLoop;
     private readonly input = new Input();
@@ -120,11 +126,20 @@ export class GameService {
         this.world = new World({ ...core, level: doc, textures });
         this.squeezeTotal.set(this.world.squeezables.totalCount);
         this.squeezed.set(0);
+        this.levelTime.set(0);
+        this.playingLevelId = level.id;
 
         this.screen.set('playing');
         this.fadeOpacity.set(0);
         await sleep(FADE_SECONDS * 1000);
         this.transitioning = false;
+    }
+
+    private win(timeSeconds: number): void {
+        if (this.playingLevelId) {
+            void this.store.recordWin(this.playingLevelId, timeSeconds * 1000);
+        }
+        this.goTo('win');
     }
 
     /** Restart the current run (end screens / pause). */
@@ -176,11 +191,13 @@ export class GameService {
                 if (this.input.wasPressed('F4')) this.shadersEnabled.update((v) => !v);
                 world.update(this.input, dt);
                 this.squeezed.set(world.squeezeCount);
+                this.levelTime.set(world.levelTime);
                 this.fps.set(this.loop?.fps ?? 0);
 
-                // Win when every squeezable has been crushed. K/L remain as
+                // Win by the level's objective: reach the goal zone when one
+                // is authored, otherwise squeeze everything. K/L remain as
                 // hidden debug shortcuts for the end screens.
-                if (world.allSqueezed || this.input.wasPressed('KeyL')) this.goTo('win');
+                if (world.hasWon || this.input.wasPressed('KeyL')) this.win(world.levelTime);
                 else if (this.input.wasPressed('KeyK')) this.goTo('defeat');
                 break;
             }

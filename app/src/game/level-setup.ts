@@ -29,21 +29,56 @@ export function barCollidersFrom(level: LevelDocument): Collider[] {
  * the shape with a radius from its smaller half-extent.
  */
 export function spawnItemSqueezables(level: LevelDocument, squeezables: Squeezables): void {
-    for (const { tag, shape } of level.colliders) {
+    for (const { id, tag, group, shape } of level.colliders) {
         if (tag !== 'item') continue;
         if (shape.kind === 'rect') {
             squeezables.spawn(
                 new Vec2(shape.x + shape.w / 2, shape.y + shape.h / 2),
                 Math.min(shape.w, shape.h) / 2,
+                id,
+                group,
             );
         } else {
-            squeezables.spawn(new Vec2(shape.x, shape.y), shape.r);
+            squeezables.spawn(new Vec2(shape.x, shape.y), shape.r, id, group);
         }
     }
 }
 
+/** Sprites riding one `item` collider (index-aligned with spawn order). */
+export interface ItemSpriteLink {
+    /** `(sprite index, offset from the squeezable's centre)`. */
+    sprites: { index: number; offset: Vec2 }[];
+}
+
+/**
+ * Sprites linked to each `item` collider via `colliderId`, in the same order
+ * `spawnItemSqueezables` spawns them — so entry `i` belongs to squeezable
+ * index `i`. Linked artwork replaces the default ball and follows the object.
+ */
+export function itemSpriteLinksFrom(level: LevelDocument): ItemSpriteLink[] {
+    const links: ItemSpriteLink[] = [];
+    for (const { id, tag, shape } of level.colliders) {
+        if (tag !== 'item') continue;
+        const center =
+            shape.kind === 'rect'
+                ? new Vec2(shape.x + shape.w / 2, shape.y + shape.h / 2)
+                : new Vec2(shape.x, shape.y);
+        const sprites = level.sprites
+            .map((sprite, index) => ({ sprite, index }))
+            .filter(({ sprite }) => sprite.colliderId === id)
+            .map(({ sprite, index }) => ({
+                index,
+                offset: new Vec2(sprite.x - center.x, sprite.y - center.y),
+            }));
+        links.push({ sprites });
+    }
+    return links;
+}
+
 /** A pushable box derived from a `movable` collider rectangle. */
 export interface MovableBox {
+    /** The level collider this box came from. */
+    id: string;
     /** Current world-space AABB. */
     rect: Rect;
     /** Initial top-left, restored on reset. */
@@ -71,7 +106,7 @@ export function movableBoxesFrom(level: LevelDocument, snap: (v: number) => numb
                 index,
                 offset: new Vec2(sprite.x - rect.x, sprite.y - rect.y),
             }));
-        boxes.push({ rect, origin: rect.position(), sprites });
+        boxes.push({ id, rect, origin: rect.position(), sprites });
     }
     return boxes;
 }

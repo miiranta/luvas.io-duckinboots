@@ -3,6 +3,10 @@
         <span class="stat-label">{{ i18n.t('squeezed_label') }}</span>
         <span class="stat-value">{{ game.squeezed() }} / {{ game.squeezeTotal() }}</span>
     </div>
+    <div class="stat">
+        <span class="stat-label">{{ i18n.t('time_label') }}</span>
+        <span class="stat-value">{{ formatDuration(game.levelTime()) }}</span>
+    </div>
     <div class="stat fps">
         <span class="stat-label">{{ i18n.t('fps_label') }}</span>
         <span class="stat-value">{{ game.fps() }}</span>

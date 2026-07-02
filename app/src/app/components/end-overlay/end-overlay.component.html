@@ -4,9 +4,12 @@
     }
     <h2 class="screen-title title">{{ i18n.t(kind() === 'win' ? 'win' : 'defeat') }}</h2>
     @if (kind() === 'win') {
-        <p class="score">
-            {{ i18n.t('squeezed_label') }}: {{ game.squeezed() }} / {{ game.squeezeTotal() }}
-        </p>
+        @if (game.squeezeTotal() > 0) {
+            <p class="score">
+                {{ i18n.t('squeezed_label') }}: {{ game.squeezed() }} / {{ game.squeezeTotal() }}
+            </p>
+        }
+        <p class="score">{{ i18n.t('time_label') }}: {{ formatDuration(game.levelTime()) }}</p>
     }
     <div class="actions">
         <button class="btn" (click)="game.replay()">

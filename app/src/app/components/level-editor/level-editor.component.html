@@ -73,9 +73,17 @@
                 class="tool"
                 [class.active]="tool() === 'anchor'"
                 (click)="tool.set('anchor')"
-                title="Set chain anchor"
+                title="Add chain anchor"
             >
                 ⚓
+            </button>
+            <button
+                class="tool"
+                [class.active]="tool() === 'goal'"
+                (click)="tool.set('goal')"
+                title="Draw goal zone"
+            >
+                🏁
             </button>
             <button
                 class="tool"
@@ -223,6 +231,17 @@
                                 (change)="editShape('y', $any($event.target).value)"
                             />
                         </label>
+                        @if (c.tag === 'item' || c.tag === 'plate' || c.tag === 'button') {
+                            <label
+                                >{{ i18n.t('ed_group') }}
+                                <input
+                                    type="text"
+                                    [value]="c.group ?? ''"
+                                    placeholder="—"
+                                    (change)="editGroup($any($event.target).value)"
+                                />
+                            </label>
+                        }
                         @if (c.shape.kind === 'rect') {
                             <label
                                 >w
@@ -303,8 +322,10 @@
                                 (change)="editSpriteRide($any($event.target).value)"
                             >
                                 <option value="">—</option>
-                                @for (m of movableColliders(); track m.id) {
-                                    <option [value]="m.id">Box {{ m.id.slice(0, 6) }}</option>
+                                @for (m of rideableColliders(); track m.id) {
+                                    <option [value]="m.id">
+                                        {{ tagLabels[m.tag] }} {{ m.id.slice(0, 6) }}
+                                    </option>
                                 }
                             </select>
                         </label>
@@ -316,8 +337,57 @@
             }
 
             <section class="group">
-                <h3>{{ i18n.t('ed_level_settings') }}</h3>
+                <h3>{{ i18n.t('ed_chains') }}</h3>
+                @for (chain of level.chains; track chain.id; let i = $index) {
+                    <div class="chain-row">
+                        <span class="chain-name">C{{ i + 1 }}</span>
+                        <input
+                            type="number"
+                            min="100"
+                            step="100"
+                            [value]="chain.length"
+                            (change)="editChainLength(chain.id, $any($event.target).value)"
+                        />
+                        <button class="mini-btn danger" (click)="deleteChain(chain.id)">✕</button>
+                    </div>
+                } @empty {
+                    <p class="empty">{{ i18n.t('ed_no_chains') }}</p>
+                }
+                @if (level.goal) {
+                    <button class="tbtn danger wide" (click)="clearGoal()">
+                        {{ i18n.t('ed_clear_goal') }}
+                    </button>
+                }
+            </section>
+
+            <section class="group">
+                <h3>{{ i18n.t('ed_abilities') }}</h3>
+                <label class="check-row">
+                    <input
+                        type="checkbox"
+                        [checked]="level.abilities.push"
+                        (change)="editAbility('push', $any($event.target).checked)"
+                    />
+                    {{ i18n.t('ed_ability_push') }}
+                </label>
+                <label class="check-row">
+                    <input
+                        type="checkbox"
+                        [checked]="level.abilities.pull"
+                        (change)="editAbility('pull', $any($event.target).checked)"
+                    />
+                    {{ i18n.t('ed_ability_pull') }}
+                </label>
                 <div class="props">
+                    <label
+                        >{{ i18n.t('ed_portal_pairs') }}
+                        <input
+                            type="number"
+                            min="0"
+                            [value]="level.abilities.portalPairs"
+                            (change)="editPortalPairs($any($event.target).value)"
+                        />
+                    </label>
                     <label
                         >{{ i18n.t('ed_grid') }}
                         <input
@@ -327,17 +397,165 @@
                             (change)="editGridSize($any($event.target).value)"
                         />
                     </label>
-                    <label
-                        >{{ i18n.t('ed_chain_len') }}
-                        <input
-                            type="number"
-                            min="100"
-                            step="100"
-                            [value]="level.chainLength"
-                            (change)="editChainLength($any($event.target).value)"
-                        />
-                    </label>
                 </div>
+            </section>
+
+            <section class="group">
+                <h3>{{ i18n.t('ed_rules') }}</h3>
+                @for (rule of level.rules; track rule.id) {
+                    <div class="rule-card">
+                        <div class="rule-line">
+                            <span class="rule-kw">{{ i18n.t('ed_when') }}</span>
+                            <select
+                                [value]="rule.when.type"
+                                (change)="editRuleWhen(rule, 'type', $any($event.target).value)"
+                            >
+                                <option value="buttonPressed">{{ i18n.t('ed_ev_button') }}</option>
+                                <option value="plateActive">{{ i18n.t('ed_ev_plate') }}</option>
+                                <option value="squeezed">{{ i18n.t('ed_ev_squeezed') }}</option>
+                            </select>
+                            <select
+                                [value]="rule.when.target"
+                                (change)="editRuleWhen(rule, 'target', $any($event.target).value)"
+                            >
+                                @for (t of ruleTargets(rule.when.type); track t) {
+                                    <option [value]="t">{{ colliderLabel(t) }}</option>
+                                }
+                            </select>
+                        </div>
+                        <div class="rule-line">
+                            <span class="rule-kw">{{ i18n.t('ed_then') }}</span>
+                            <select
+                                [value]="ruleAction(rule).type"
+                                (change)="editRuleActionType(rule, $any($event.target).value)"
+                            >
+                                <option value="breakChain">{{ i18n.t('ed_act_break') }}</option>
+                                <option value="setAbility">{{ i18n.t('ed_act_ability') }}</option>
+                                <option value="addPortalPairs">
+                                    {{ i18n.t('ed_act_portals') }}
+                                </option>
+                                <option value="setMovable">{{ i18n.t('ed_act_movable') }}</option>
+                                <option value="removeCollider">
+                                    {{ i18n.t('ed_act_remove') }}
+                                </option>
+                            </select>
+                        </div>
+                        <div class="rule-line">
+                            @switch (ruleAction(rule).type) {
+                                @case ('breakChain') {
+                                    <select
+                                        [value]="$any(ruleAction(rule)).chainId"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'chainId',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        @for (
+                                            chain of level.chains;
+                                            track chain.id;
+                                            let i = $index
+                                        ) {
+                                            <option [value]="chain.id">C{{ i + 1 }}</option>
+                                        }
+                                    </select>
+                                }
+                                @case ('setAbility') {
+                                    <select
+                                        [value]="$any(ruleAction(rule)).ability"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'ability',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        <option value="push">{{ i18n.t('ed_ability_push') }}</option>
+                                        <option value="pull">{{ i18n.t('ed_ability_pull') }}</option>
+                                    </select>
+                                    <select
+                                        [value]="'' + $any(ruleAction(rule)).value"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'value',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        <option value="true">ON</option>
+                                        <option value="false">OFF</option>
+                                    </select>
+                                }
+                                @case ('addPortalPairs') {
+                                    <input
+                                        type="number"
+                                        [value]="$any(ruleAction(rule)).amount"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'amount',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    />
+                                }
+                                @case ('setMovable') {
+                                    <select
+                                        [value]="$any(ruleAction(rule)).colliderId"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'colliderId',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        @for (c of level.colliders; track c.id) {
+                                            <option [value]="c.id">{{ colliderLabel(c.id) }}</option>
+                                        }
+                                    </select>
+                                    <select
+                                        [value]="'' + $any(ruleAction(rule)).movable"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'movable',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        <option value="true">{{ i18n.t('ed_movable_on') }}</option>
+                                        <option value="false">{{ i18n.t('ed_movable_off') }}</option>
+                                    </select>
+                                }
+                                @case ('removeCollider') {
+                                    <select
+                                        [value]="$any(ruleAction(rule)).colliderId"
+                                        (change)="
+                                            editRuleActionParam(
+                                                rule,
+                                                'colliderId',
+                                                $any($event.target).value
+                                            )
+                                        "
+                                    >
+                                        @for (c of level.colliders; track c.id) {
+                                            <option [value]="c.id">{{ colliderLabel(c.id) }}</option>
+                                        }
+                                    </select>
+                                }
+                            }
+                            <button class="mini-btn danger" (click)="deleteRule(rule.id)">✕</button>
+                        </div>
+                    </div>
+                } @empty {
+                    <p class="empty">{{ i18n.t('ed_no_rules') }}</p>
+                }
+                <button class="tbtn wide" (click)="addRule()">+ {{ i18n.t('ed_add_rule') }}</button>
             </section>
         </aside>
     </div>

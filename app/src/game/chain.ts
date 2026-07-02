@@ -48,6 +48,14 @@ const CONSTRAINT_EPS_SQ = 0.0001;
 /** Midpoint-relaxation strength used to tighten frozen spans. */
 const TIGHTEN_STRENGTH = 0.35;
 /**
+ * Slack headroom (in segments) the active span keeps ahead of the player
+ * after a portal crossing. Rope starts paying through the portal as soon as
+ * the active span comes within this margin of taut, so walking away from an
+ * exit portal feels like the rope slides freely — with a small margin the
+ * rope only fed once fully stretched, which read as heavy portal friction.
+ */
+const PULLTHROUGH_HEADROOM_SEGMENTS = 16;
+/**
  * The rope's physical half-thickness. Every point sweep and push-out inflates
  * obstacles by this radius **with rounded corners**, so the rope keeps a
  * standoff on flat faces and — crucially — its contact normal rotates
@@ -544,7 +552,7 @@ export class Chain {
         // Rope is requested when the active span nears its current capacity
         // (the player is pulling), or when total rope has crept over budget.
         let demand = Math.max(
-            activePath - (capacity - 2 * this.segmentLength),
+            activePath - (capacity - PULLTHROUGH_HEADROOM_SEGMENTS * this.segmentLength),
             activePath - (this.budget - consumed),
             0,
         );

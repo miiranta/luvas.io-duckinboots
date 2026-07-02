@@ -61,6 +61,11 @@
                                         }
                                     </span>
                                     <span class="level-meta">
+                                        @if (level.progress; as p) {
+                                            <span class="progress-badge">
+                                                ✔ {{ formatDuration(p.bestTimeMs / 1000) }}
+                                            </span>
+                                        }
                                         {{ level.colliderCount }} · {{ level.assetCount }} 🖼
                                     </span>
                                 </div>

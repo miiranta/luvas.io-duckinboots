@@ -1,6 +1,7 @@
 import { Component, inject, input } from '@angular/core';
 import { GameService } from '../../services/game.service';
 import { I18nService } from '../../services/i18n.service';
+import { formatDuration } from '../../util/time';
 
 /** Win / defeat end screen over the frozen world. */
 @Component({
@@ -12,4 +13,5 @@ export class EndOverlayComponent {
     readonly kind = input.required<'win' | 'defeat'>();
     protected readonly game = inject(GameService);
     protected readonly i18n = inject(I18nService);
+    protected readonly formatDuration = formatDuration;
 }

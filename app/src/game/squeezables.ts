@@ -10,13 +10,21 @@ import { Collider, circleCollider } from './collision';
 
 export interface SqueezeEvent {
     id: number;
+    /** Level collider id this squeezable was spawned from (rules target it). */
+    colliderId: string;
+    group?: string;
     pos: Vec2;
     radius: number;
 }
 
 interface Squeezable {
     id: number;
+    colliderId: string;
+    /** Multi-squeeze group: every alive member must be cinched at once. */
+    group?: string;
     pos: Vec2;
+    /** Spawn position, restored on revive. */
+    origin: Vec2;
     radius: number;
     alive: boolean;
 }
@@ -38,9 +46,17 @@ export class Squeezables {
     private listeners: ((ev: SqueezeEvent) => void)[] = [];
     private nextId = 0;
 
-    spawn(pos: Vec2, radius: number): number {
+    spawn(pos: Vec2, radius: number, colliderId = '', group?: string): number {
         const id = this.nextId++;
-        this.items.push({ id, pos: pos.clone(), radius, alive: true });
+        this.items.push({
+            id,
+            colliderId,
+            group,
+            pos: pos.clone(),
+            origin: pos.clone(),
+            radius,
+            alive: true,
+        });
         return id;
     }
 
@@ -48,9 +64,21 @@ export class Squeezables {
         this.listeners.push(listener);
     }
 
-    /** Bring every object back to life (fresh run). Listeners are kept. */
+    /** Revive every object at its spawn position (fresh run). Listeners are kept. */
     reviveAll(): void {
-        for (const s of this.items) s.alive = true;
+        for (const s of this.items) {
+            s.alive = true;
+            s.pos = s.origin.clone();
+        }
+    }
+
+    /** Centre of the object at `index` (regardless of alive state). */
+    centerOf(index: number): Vec2 {
+        return this.items[index].pos;
+    }
+
+    isAlive(index: number): boolean {
+        return this.items[index]?.alive ?? false;
     }
 
     get aliveCount(): number {
@@ -87,25 +115,48 @@ export class Squeezables {
 
     /**
      * Check every living object against every rope span; crush the ones a
-     * chain has looped tight and fire the listeners. Call once per frame
-     * after the chains have been simulated.
+     * chain has looped tight and fire the listeners. Grouped objects only
+     * die when **every alive member of the group is cinched in the same
+     * frame** (the multi-squeeze mechanic). Call once per frame after the
+     * chains have been simulated.
      */
     update(chains: readonly Chain[]): void {
-        const crushed: SqueezeEvent[] = [];
+        const cinched = new Set<Squeezable>();
         for (const s of this.items) {
             if (!s.alive) continue;
-            const cinched = chains.some((chain) => {
+            const hit = chains.some((chain) => {
                 const stretch = chain.stretch();
                 return chain.spanPoints().some((pts) => spanCinches(pts, stretch, s.pos, s.radius));
             });
-            if (cinched) {
-                s.alive = false;
-                crushed.push({ id: s.id, pos: s.pos, radius: s.radius });
+            if (hit) cinched.add(s);
+        }
+
+        const crushed: SqueezeEvent[] = [];
+        for (const s of cinched) {
+            if (s.group) {
+                const members = this.items.filter((o) => o.alive && o.group === s.group);
+                if (!members.every((o) => cinched.has(o))) continue;
             }
+            s.alive = false;
+            crushed.push({
+                id: s.id,
+                colliderId: s.colliderId,
+                group: s.group,
+                pos: s.pos,
+                radius: s.radius,
+            });
         }
         for (const ev of crushed) {
             for (const listener of this.listeners) listener(ev);
         }
+    }
+
+    /** True when the collider id / group name has been fully squeezed. */
+    allSqueezedFor(target: string): boolean {
+        const members = this.items.filter(
+            (s) => s.colliderId === target || s.group === target,
+        );
+        return members.length > 0 && members.every((s) => !s.alive);
     }
 
     /** Draw one living object (used by the world's Y-sort). */

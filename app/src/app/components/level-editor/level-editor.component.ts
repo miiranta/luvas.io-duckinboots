@@ -17,7 +17,10 @@ import {
     LevelAsset,
     LevelCollider,
     LevelDocument,
+    LevelRule,
     LevelSprite,
+    RuleAction,
+    RuleEventType,
     TAG_COLORS,
     TAG_LABELS,
     cloneLevel,
@@ -29,7 +32,7 @@ import {
 import { GameTexture, decodeAsset, fileToDataUrl } from '../../../engine/textures';
 import { Rect, Vec2, clamp } from '../../../engine/math';
 
-type Tool = 'select' | 'rect' | 'circle' | 'sprite' | 'start' | 'anchor' | 'erase';
+type Tool = 'select' | 'rect' | 'circle' | 'sprite' | 'start' | 'anchor' | 'goal' | 'erase';
 
 type Selection = { kind: 'collider' | 'sprite'; id: string } | null;
 
@@ -276,6 +279,7 @@ export class LevelEditorComponent implements OnDestroy {
         switch (this.tool()) {
             case 'rect':
             case 'circle':
+            case 'goal':
                 this.drag = { op: 'draw', from: this.snapVec(p), to: this.snapVec(p) };
                 break;
             case 'sprite': {
@@ -303,8 +307,13 @@ export class LevelEditorComponent implements OnDestroy {
                 this.touched();
                 break;
             case 'anchor':
+                // Each click adds another chain; lengths edit in the panel.
                 this.snapshot();
-                this.level.chainAnchor = { x: this.snap(p.x), y: this.snap(p.y) };
+                this.level.chains.push({
+                    id: newId(),
+                    anchor: { x: this.snap(p.x), y: this.snap(p.y) },
+                    length: 1600,
+                });
                 this.touched();
                 break;
             case 'erase': {
@@ -418,6 +427,17 @@ export class LevelEditorComponent implements OnDestroy {
 
         const from = d.from;
         const to = d.to;
+        if (this.tool() === 'goal') {
+            const x = Math.min(from.x, to.x);
+            const y = Math.min(from.y, to.y);
+            const w = Math.abs(to.x - from.x);
+            const h = Math.abs(to.y - from.y);
+            if (w < 8 || h < 8) return;
+            this.snapshot();
+            this.level.goal = { x, y, w, h };
+            this.touched();
+            return;
+        }
         if (this.tool() === 'rect') {
             const x = Math.min(from.x, to.x);
             const y = Math.min(from.y, to.y);
@@ -543,10 +563,12 @@ export class LevelEditorComponent implements OnDestroy {
         return sel?.kind === 'sprite' ? (this.spriteById(sel.id) ?? null) : null;
     }
 
-    /** Movable rect colliders a sprite can ride. */
-    protected movableColliders(): LevelCollider[] {
+    /** Colliders a sprite can ride: movable boxes and squeezable items. */
+    protected rideableColliders(): LevelCollider[] {
         this.rev();
-        return this.level.colliders.filter((c) => c.tag === 'movable' && c.shape.kind === 'rect');
+        return this.level.colliders.filter(
+            (c) => (c.tag === 'movable' && c.shape.kind === 'rect') || c.tag === 'item',
+        );
     }
 
     private deleteSelectionObj(sel: NonNullable<Selection>): void {
@@ -625,12 +647,137 @@ export class LevelEditorComponent implements OnDestroy {
         }
     }
 
-    protected editChainLength(value: string): void {
+    // ── Chains / goal / abilities / rules ────────────────────────────────────
+
+    protected editChainLength(chainId: string, value: string): void {
+        const chain = this.level.chains.find((c) => c.id === chainId);
         const v = Number(value);
-        if (Number.isFinite(v) && v >= 100) {
-            this.level.chainLength = Math.round(v);
+        if (chain && Number.isFinite(v) && v >= 100) {
+            this.snapshot();
+            chain.length = Math.round(v);
             this.touched();
         }
+    }
+
+    protected deleteChain(chainId: string): void {
+        this.snapshot();
+        this.level.chains = this.level.chains.filter((c) => c.id !== chainId);
+        // Rules breaking this chain no longer make sense.
+        this.level.rules = this.level.rules.filter(
+            (r) => !r.actions.some((a) => a.type === 'breakChain' && a.chainId === chainId),
+        );
+        this.touched();
+    }
+
+    protected clearGoal(): void {
+        this.snapshot();
+        this.level.goal = null;
+        this.touched();
+    }
+
+    protected editGroup(value: string): void {
+        const c = this.selectedCollider();
+        if (!c) return;
+        this.snapshot();
+        c.group = value.trim() || undefined;
+        this.touched();
+    }
+
+    protected editAbility(ability: 'push' | 'pull', value: boolean): void {
+        this.snapshot();
+        this.level.abilities[ability] = value;
+        this.touched();
+    }
+
+    protected editPortalPairs(value: string): void {
+        const v = Number(value);
+        if (Number.isFinite(v) && v >= 0) {
+            this.snapshot();
+            this.level.abilities.portalPairs = Math.round(v);
+            this.touched();
+        }
+    }
+
+    /** Event targets available for a rule type: collider ids + group names. */
+    protected ruleTargets(type: RuleEventType): string[] {
+        this.rev();
+        const tag = type === 'buttonPressed' ? 'button' : type === 'plateActive' ? 'plate' : 'item';
+        const matching = this.level.colliders.filter((c) => c.tag === tag);
+        const ids = matching.map((c) => c.id);
+        const groups = [...new Set(matching.map((c) => c.group).filter((g): g is string => !!g))];
+        return [...groups, ...ids];
+    }
+
+    protected addRule(): void {
+        this.snapshot();
+        const target = this.ruleTargets('buttonPressed')[0] ?? '';
+        this.level.rules.push({
+            id: newId(),
+            when: { type: 'buttonPressed', target },
+            actions: [{ type: 'breakChain', chainId: this.level.chains[0]?.id ?? '' }],
+        });
+        this.touched();
+    }
+
+    protected deleteRule(id: string): void {
+        this.snapshot();
+        this.level.rules = this.level.rules.filter((r) => r.id !== id);
+        this.touched();
+    }
+
+    protected editRuleWhen(rule: LevelRule, field: 'type' | 'target', value: string): void {
+        this.snapshot();
+        if (field === 'type') {
+            rule.when.type = value as RuleEventType;
+            rule.when.target = this.ruleTargets(rule.when.type)[0] ?? '';
+        } else {
+            rule.when.target = value;
+        }
+        this.touched();
+    }
+
+    /** The editor edits one action per rule (the format allows several). */
+    protected ruleAction(rule: LevelRule): RuleAction {
+        return rule.actions[0];
+    }
+
+    protected editRuleActionType(rule: LevelRule, type: string): void {
+        this.snapshot();
+        switch (type) {
+            case 'breakChain':
+                rule.actions = [{ type, chainId: this.level.chains[0]?.id ?? '' }];
+                break;
+            case 'setAbility':
+                rule.actions = [{ type, ability: 'pull', value: false }];
+                break;
+            case 'addPortalPairs':
+                rule.actions = [{ type, amount: 1 }];
+                break;
+            case 'setMovable':
+                rule.actions = [
+                    { type, colliderId: this.level.colliders[0]?.id ?? '', movable: true },
+                ];
+                break;
+            case 'removeCollider':
+                rule.actions = [{ type, colliderId: this.level.colliders[0]?.id ?? '' }];
+                break;
+        }
+        this.touched();
+    }
+
+    protected editRuleActionParam(rule: LevelRule, param: string, value: string): void {
+        this.snapshot();
+        const action = rule.actions[0] as unknown as Record<string, unknown>;
+        if (param === 'amount') action[param] = Number(value) || 0;
+        else if (param === 'value' || param === 'movable') action[param] = value === 'true';
+        else action[param] = value;
+        this.touched();
+    }
+
+    /** Label for a collider in rule dropdowns. */
+    protected colliderLabel(id: string): string {
+        const c = this.level.colliders.find((col) => col.id === id);
+        return c ? `${TAG_LABELS[c.tag]} ${id.slice(0, 6)}` : id.slice(0, 6);
     }
 
     // ── Assets ───────────────────────────────────────────────────────────────
@@ -849,17 +996,31 @@ export class LevelEditorComponent implements OnDestroy {
         ctx.lineWidth = lw;
         ctx.strokeRect(ps.x, ps.y, 32, 32);
         this.label(ctx, 'START', ps.x + 16, ps.y - 6, '#3fe36f');
-        // Chain anchor: gold ring.
-        const an = this.level.chainAnchor;
-        ctx.strokeStyle = '#e8bd4a';
-        ctx.beginPath();
-        ctx.arc(an.x, an.y, 8, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.fillStyle = '#e8bd4a';
-        ctx.beginPath();
-        ctx.arc(an.x, an.y, 3, 0, Math.PI * 2);
-        ctx.fill();
-        this.label(ctx, 'ANCHOR', an.x, an.y - 14, '#e8bd4a');
+        // Chain anchors: numbered gold rings.
+        this.level.chains.forEach((chain, i) => {
+            const an = chain.anchor;
+            ctx.strokeStyle = '#e8bd4a';
+            ctx.beginPath();
+            ctx.arc(an.x, an.y, 8, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.fillStyle = '#e8bd4a';
+            ctx.beginPath();
+            ctx.arc(an.x, an.y, 3, 0, Math.PI * 2);
+            ctx.fill();
+            this.label(ctx, `C${i + 1} (${chain.length})`, an.x, an.y - 14, '#e8bd4a');
+        });
+        // Goal zone.
+        const g = this.level.goal;
+        if (g) {
+            ctx.strokeStyle = '#ffd970';
+            ctx.lineWidth = lw;
+            ctx.setLineDash([8 / this.cam.zoom, 5 / this.cam.zoom]);
+            ctx.strokeRect(g.x, g.y, g.w, g.h);
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgb(232 189 74 / 10%)';
+            ctx.fillRect(g.x, g.y, g.w, g.h);
+            this.label(ctx, 'GOAL', g.x + g.w / 2, g.y - 6, '#ffd970');
+        }
     }
 
     private label(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string): void {
@@ -915,11 +1076,11 @@ export class LevelEditorComponent implements OnDestroy {
     private drawDragPreview(ctx: CanvasRenderingContext2D): void {
         const d = this.drag;
         if (!d || d.op !== 'draw') return;
-        const color = TAG_COLORS[this.tag()];
+        const color = this.tool() === 'goal' ? '#ffd970' : TAG_COLORS[this.tag()];
         ctx.fillStyle = color + '44';
         ctx.strokeStyle = color;
         ctx.lineWidth = 2 / this.cam.zoom;
-        if (this.tool() === 'rect') {
+        if (this.tool() !== 'circle') {
             const x = Math.min(d.from.x, d.to.x);
             const y = Math.min(d.from.y, d.to.y);
             ctx.fillRect(x, y, Math.abs(d.to.x - d.from.x), Math.abs(d.to.y - d.from.y));
