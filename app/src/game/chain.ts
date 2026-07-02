@@ -106,6 +106,8 @@ export class Chain {
     private chainObstacles: Collider[] = [];
     /** Animated dash offset that makes the link pattern crawl along the rope. */
     private dashPhase = 0;
+    /** Rope freed by pull-through but not yet converted into an active joint. */
+    private pendingRope = 0;
 
     constructor(anchor: Vec2, end: Vec2, totalLength: number, linkSize: number, color: string) {
         const numSegments = Math.max(1, Math.ceil(totalLength / linkSize));
@@ -132,13 +134,25 @@ export class Chain {
         return this.spans[this.spans.length - 1];
     }
 
-    /** Joint count the active span gets for the rope left after the frozen fMins. */
-    private activeJointCount(): number {
-        const frozenMin = this.spans
-            .slice(0, -1)
-            .reduce((s, span) => s + span.fMin, 0);
-        const rope = Math.max(this.budget - frozenMin, this.segmentLength);
-        return Math.max(2, Math.round(rope / this.segmentLength) + 1);
+    /**
+     * Joint count for a span holding `rope` length of rope.
+     *
+     * The active span is created with the rope *actually* left over at split
+     * time and **grows** via [`feedActiveSpan`] as pull-through frees rope —
+     * so the rope's total capacity never exceeds the budget, even when
+     * geometry stops a frozen span from ever reaching its straight-line
+     * minimum. (The original sized the active span off that theoretical
+     * minimum up front, which made the chain grow at every portal crossing.)
+     */
+    private jointCountForRope(rope: number): number {
+        const clamped = Math.max(rope, this.segmentLength);
+        return Math.max(2, Math.round(clamped / this.segmentLength) + 1);
+    }
+
+    /** Hard ceiling on active joints: every frozen span pulled fully taut. */
+    private maxActiveJointCount(): number {
+        const frozenMin = this.spans.slice(0, -1).reduce((s, span) => s + span.fMin, 0);
+        return this.jointCountForRope(this.budget - frozenMin);
     }
 
     /** Grow the scratch arrays to cover the active span's joints. */
@@ -234,7 +248,14 @@ export class Chain {
         last.oldPos = inCenter.clone();
         span.fMin = span.joints[0].pos.distance(inCenter);
 
-        this.spans.push(this.straightSpan(outCenter, playerPt, this.activeJointCount()));
+        // Rope actually left over right now: the budget minus what every
+        // (now-frozen) span currently holds. `spans` has no active entry at
+        // this point, so sum them all explicitly.
+        const consumed = this.spans.reduce((s, sp) => s + Chain.spanLength(sp), 0);
+        this.pendingRope = 0;
+        this.spans.push(
+            this.straightSpan(outCenter, playerPt, this.jointCountForRope(this.budget - consumed)),
+        );
         this.resizeScratch();
         this.clearContacts();
     }
@@ -256,7 +277,15 @@ export class Chain {
 
         const shape = reabsorbed.joints.map((j) => j.pos);
         shape.push(playerPt.clone());
-        const points = resamplePolyline(shape, this.activeJointCount());
+        this.pendingRope = 0;
+        // Capacity for the merged span: budget minus the remaining frozen
+        // spans (all entries left in `spans` right now), never less than the
+        // reabsorbed shape itself.
+        const consumed = this.spans.reduce((s, sp) => s + Chain.spanLength(sp), 0);
+        let shapeLen = 0;
+        for (let i = 1; i < shape.length; i++) shapeLen += shape[i - 1].distance(shape[i]);
+        const rope = Math.max(this.budget - consumed, shapeLen);
+        const points = resamplePolyline(shape, this.jointCountForRope(rope));
         this.spans.push({
             joints: points.map((p) => makeJoint(p)),
             fMin: 0,
@@ -495,23 +524,57 @@ export class Chain {
 
     /**
      * Shrink the frozen spans by however much rope the active span currently
-     * demands, nearest-the-player first.
+     * demands, nearest-the-player first, and **feed the freed rope into the
+     * active span** as new joints at the portal mouth. Rope pays through the
+     * portal exactly as fast as the frozen side physically gives it up, so
+     * total rope is conserved at all times.
      */
     private applyPullthrough(staticGrid: ColliderGrid, dynamics: readonly Collider[]): void {
         const frozenCount = this.spans.length - 1;
         if (frozenCount === 0) return;
         const lengths = this.spans.slice(0, -1).map((s) => Chain.spanLength(s));
         const consumed = lengths.reduce((s, l) => s + l, 0);
-        const activePath = Chain.spanLength(this.active());
+        const active = this.active();
+        const activePath = Chain.spanLength(active);
+        const capacity = (active.joints.length - 1) * this.segmentLength;
         const slack = this.spans
             .slice(0, -1)
             .reduce((s, span, i) => s + Math.max(0, lengths[i] - span.fMin), 0);
-        let demand = Math.min(Math.max(activePath - (this.budget - consumed), 0), slack);
+
+        // Rope is requested when the active span nears its current capacity
+        // (the player is pulling), or when total rope has crept over budget.
+        let demand = Math.max(
+            activePath - (capacity - 2 * this.segmentLength),
+            activePath - (this.budget - consumed),
+            0,
+        );
+        demand = Math.min(demand, slack);
 
         for (let idx = frozenCount - 1; idx >= 0 && demand > 0.25; idx--) {
             const targetLen = Math.max(this.spans[idx].fMin, lengths[idx] - demand);
-            demand -= this.tightenSpan(this.spans[idx], targetLen, staticGrid, dynamics);
+            const freed = this.tightenSpan(this.spans[idx], targetLen, staticGrid, dynamics);
+            demand -= freed;
+            this.pendingRope += freed;
         }
+        this.feedActiveSpan();
+    }
+
+    /**
+     * Convert freed rope into new active-span joints, inserted at the portal
+     * mouth (the active span's pinned start), one per `segmentLength` of rope.
+     * Capped so the active span can never exceed the all-frozen-spans-taut
+     * ceiling.
+     */
+    private feedActiveSpan(): void {
+        const joints = this.active().joints;
+        const cap = this.maxActiveJointCount();
+        while (this.pendingRope >= this.segmentLength && joints.length < cap) {
+            this.pendingRope -= this.segmentLength;
+            const joint = makeJoint(joints[0].pos.clone());
+            joint.heat = 1;
+            joints.splice(1, 0, joint);
+        }
+        this.resizeScratch();
     }
 
     /**
