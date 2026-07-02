@@ -42,6 +42,8 @@ class PortalInstance {
     constructor(
         readonly circle: Circle,
         private readonly sheet: SpriteSheet,
+        /** Sparkle tint matching the portal art (purple or green). */
+        readonly tint: string,
     ) {
         this.anim = new Animation(sheet, ROW_OPENING, PORTAL_FPS, false);
     }
@@ -88,7 +90,8 @@ export class Portals {
     place(center: Vec2): void {
         const circle = new Circle(center.clone(), PORTAL_RADIUS);
         const sheet = this.pending ? this.greenSheet : this.purpleSheet;
-        const instance = new PortalInstance(circle, sheet);
+        const tint = this.pending ? '#7ee787' : '#c39bff';
+        const instance = new PortalInstance(circle, sheet, tint);
         if (!this.pending) {
             this.pending = instance;
         } else {
@@ -116,6 +119,22 @@ export class Portals {
             pair.b.startClosing();
         }
         this.pending?.startClosing();
+    }
+
+    /** Every idle (interactive) portal, for ambient sparkle effects. */
+    idlePortals(): { center: Vec2; radius: number; tint: string }[] {
+        const out: { center: Vec2; radius: number; tint: string }[] = [];
+        const push = (p: PortalInstance) => {
+            if (p.state === 'idle') {
+                out.push({ center: p.circle.center, radius: p.circle.radius, tint: p.tint });
+            }
+        };
+        for (const pair of this.pairs) {
+            push(pair.a);
+            push(pair.b);
+        }
+        if (this.pending) push(this.pending);
+        return out;
     }
 
     /** True when every portal has finished closing (or there are none). */

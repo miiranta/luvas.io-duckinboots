@@ -24,6 +24,7 @@ import {
 } from './level-setup';
 import { Player } from './player';
 import { Chain } from './chain';
+import { Particles } from './particles';
 import { Portals } from './portals';
 import { Squeezables } from './squeezables';
 
@@ -152,6 +153,8 @@ export class World {
 
     readonly squeezables = new Squeezables();
     squeezeCount = 0;
+    private readonly particles = new Particles();
+    private dustTimer = 0;
 
     zoom = 3;
     debugCollisions = false;
@@ -161,6 +164,13 @@ export class World {
     private playerColliders: Collider[] = [];
     private moveColliders: Collider[] = [];
     private dynamicColliders: Collider[] = [];
+
+    // This frame's world→device transform (x_dev = x * scale + tx), captured
+    // in `draw` so sprites can snap their destination rects to whole device
+    // pixels — see `drawSprite`.
+    private frameScale = 1;
+    private frameTx = 0;
+    private frameTy = 0;
 
     constructor(private readonly assets: WorldAssets) {
         this.level = assets.level;
@@ -180,7 +190,10 @@ export class World {
         this.prevPlayerPos = this.player.pos.clone();
 
         spawnItemSqueezables(this.level, this.squeezables);
-        this.squeezables.onSqueeze(() => this.squeezeCount++);
+        this.squeezables.onSqueeze((ev) => {
+            this.squeezeCount++;
+            this.particles.burst(ev.pos, ['#f5008c', '#ff8fc8', '#ffd6ea'], 26, 150, 0.8);
+        });
 
         this.chains = this.newChains();
         this.portals = new Portals(assets.portalPurple, assets.portalGreen);
@@ -241,7 +254,27 @@ export class World {
         }
         if (!this.portalsRestarting && input.wasPressed('Space')) {
             this.portals.place(this.player.chainPoint());
+            this.particles.burst(this.player.chainPoint(), ['#c39bff', '#fff'], 14, 90, 0.5);
         }
+
+        // Ambient sparkles drifting off the idle portal rings.
+        for (const p of this.portals.idlePortals()) {
+            if (Math.random() < dt * 3) {
+                const angle = Math.random() * Math.PI * 2;
+                const at = p.center.add(new Vec2(Math.cos(angle), Math.sin(angle)).scale(p.radius * 0.85));
+                this.particles.sparkle(at, p.tint);
+            }
+        }
+
+        // Footstep dust while the duck runs.
+        this.dustTimer -= dt;
+        const speed = this.player.velocity.length();
+        if (speed > 180 && this.dustTimer <= 0) {
+            this.dustTimer = 0.07;
+            const feet = this.player.pos.add(new Vec2(this.player.shape.x / 2, this.player.shape.y - 2));
+            this.particles.dust(feet, this.player.velocity.normalize());
+        }
+        this.particles.update(dt);
 
         // ── Collision phase ──────────────────────────────────────────────────
         // Move the player continuously (sliding on the static world), shoving
@@ -636,6 +669,9 @@ export class World {
         // The visible world rect (plus a margin) — everything outside is
         // culled, which matters with 1000+ sprite instances in the level.
         const scale = camera.effectiveZoom(height);
+        this.frameScale = scale;
+        this.frameTx = camera.offset.x - camera.target.x * scale;
+        this.frameTy = camera.offset.y - camera.target.y * scale;
         const view = new Rect(
             camera.target.x - width / 2 / scale,
             camera.target.y - height / 2 / scale,
@@ -655,9 +691,30 @@ export class World {
         ctx.fill();
         this.portals.draw(ctx);
 
+        // Soft contact shadows under the dynamic entities, above the floor
+        // decals but below the entities themselves.
+        this.drawShadows(ctx);
+
         this.drawYSorted(ctx, view);
+        this.particles.draw(ctx);
         if (this.debugCollisions) this.drawDebug(ctx);
 
+        ctx.restore();
+    }
+
+    /** Elliptical contact shadows for the duck and the squeezable balls. */
+    private drawShadows(ctx: CanvasRenderingContext2D): void {
+        ctx.save();
+        ctx.fillStyle = 'rgb(0 0 0 / 22%)';
+        const feet = this.player.pos.add(new Vec2(this.player.shape.x / 2, this.player.shape.y));
+        ctx.beginPath();
+        ctx.ellipse(feet.x, feet.y + 1, 11, 3.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        for (const { center, radius } of this.squeezables.eachAlive()) {
+            ctx.beginPath();
+            ctx.ellipse(center.x, center.y + radius * 0.85, radius * 0.8, radius * 0.28, 0, 0, Math.PI * 2);
+            ctx.fill();
+        }
         ctx.restore();
     }
 
@@ -717,17 +774,26 @@ export class World {
         for (const i of small) this.drawSprite(ctx, i);
     }
 
+    /**
+     * Draw a sprite with its destination rect **snapped to whole device
+     * pixels**. Adjacent tiles authored flush share the same world edge, so
+     * after rounding they share the same device edge — this is what removes
+     * the black seam lines that fractional scaling otherwise leaves between
+     * tiles (each tile's edges rounding differently exposes the background).
+     */
     private drawSprite(ctx: CanvasRenderingContext2D, i: number): void {
         const inst = (this.level.sprite_instances ?? [])[i];
         const tex = this.textures.get(inst.path);
         if (!tex) return;
-        ctx.drawImage(
-            tex,
-            inst.x,
-            inst.y,
-            tex.naturalWidth * inst.scale,
-            tex.naturalHeight * inst.scale,
-        );
+        const s = this.frameScale;
+        const x0 = Math.round(inst.x * s + this.frameTx);
+        const y0 = Math.round(inst.y * s + this.frameTy);
+        const x1 = Math.round((inst.x + tex.naturalWidth * inst.scale) * s + this.frameTx);
+        const y1 = Math.round((inst.y + tex.naturalHeight * inst.scale) * s + this.frameTy);
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(tex, x0, y0, x1 - x0, y1 - y0);
+        ctx.restore();
     }
 
     /** Debug overlay: collision shapes, movable boxes, player collider. */

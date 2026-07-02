@@ -1,8 +1,9 @@
-import { Injectable, signal } from '@angular/core';
+import { Injectable, computed, signal } from '@angular/core';
 import { GameLoop } from '../../engine/loop';
 import { Input } from '../../engine/input';
 import { loadImage, loadImageMap, loadJson } from '../../engine/assets';
 import { LevelData } from '../../engine/level';
+import { PostProcessor } from '../../engine/post-processor';
 import { SpriteSheet } from '../../engine/sprite-sheet';
 import { World } from '../../game/world';
 
@@ -24,19 +25,34 @@ export class GameService {
     readonly squeezed = signal(0);
     readonly squeezeTotal = signal(0);
     readonly fps = signal(0);
+    /** User toggle for the shader effects (F4). */
+    readonly shadersEnabled = signal(true);
+    /** Whether WebGPU post-processing is available on this device. */
+    readonly shadersSupported = signal(false);
+    /** True when the effect canvas is the one being shown. */
+    readonly shadersActive = computed(
+        () => this.shadersSupported() && this.shadersEnabled() && this.inWorld(),
+    );
+    private readonly inWorld = signal(false);
 
     private world?: World;
     private loop?: GameLoop;
     private readonly input = new Input();
     private canvas?: HTMLCanvasElement;
     private ctx?: CanvasRenderingContext2D;
+    private post: PostProcessor | null = null;
+    private elapsed = 0;
     private transitioning = false;
 
     /** Load all assets and start the loop. Called once by the canvas component. */
-    async init(canvas: HTMLCanvasElement): Promise<void> {
+    async init(canvas: HTMLCanvasElement, effectCanvas?: HTMLCanvasElement): Promise<void> {
         if (this.loop) return;
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d') ?? undefined;
+        if (effectCanvas) {
+            this.post = await PostProcessor.create(effectCanvas);
+            this.shadersSupported.set(this.post !== null);
+        }
 
         const [duckyImg, purpleImg, greenImg, level] = await Promise.all([
             loadImage('assets/sprites/ducky_spritesheet.png'),
@@ -73,6 +89,8 @@ export class GameService {
         this.loop?.stop();
         this.loop = undefined;
         this.input.detach();
+        this.post?.destroy();
+        this.post = null;
     }
 
     // ── Intents (called by the UI) ───────────────────────────────────────────
@@ -112,6 +130,7 @@ export class GameService {
                     break;
                 }
                 if (this.input.wasPressed('KeyF')) this.toggleFullscreen();
+                if (this.input.wasPressed('F4')) this.shadersEnabled.update((v) => !v);
                 world.update(this.input, dt);
                 this.squeezed.set(world.squeezeCount);
                 this.fps.set(this.loop?.fps ?? 0);
@@ -153,8 +172,15 @@ export class GameService {
         }
 
         const screen = this.screen();
-        if (screen === 'playing' || screen === 'paused' || screen === 'win' || screen === 'defeat') {
-            world.draw(ctx, w, h);
+        const inWorld =
+            screen === 'playing' || screen === 'paused' || screen === 'win' || screen === 'defeat';
+        this.inWorld.set(inWorld);
+        if (!inWorld) return;
+
+        world.draw(ctx, w, h);
+        this.elapsed += 1 / 60;
+        if (this.shadersActive() && this.post) {
+            this.post.render(canvas, this.elapsed, 1);
         }
     }
 

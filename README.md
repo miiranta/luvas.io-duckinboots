@@ -18,6 +18,7 @@ the chain tight around every magenta ball to squeeze them all and win.
 | P / ESC | Pause |
 | F | Fullscreen (while playing) |
 | F3 | Collision debug overlay |
+| F4 | Toggle shader effects |
 
 ## Structure
 
@@ -37,14 +38,30 @@ ported — `level.json` is consumed as authored.
 
 **Physics notes:** collision is continuous (swept AABB/point with slide), so
 nothing tunnels at any speed; the broad phase is a uniform spatial hash grid
-built once from the static level. The chain is a swept-Verlet constraint
-solver. Two fixes over the original: portal pull-through tightens frozen
-snippets by midpoint relaxation with swept joint moves (they wrap corners
-like a rope over a pulley instead of lerping straight through walls), and
-merging back through a portal rebuilds the chain from its current shape
-rather than a straight line (which could cross geometry). Squeezables are
-circle colliders, so the chain hugs them roundly and the tight-loop squeeze
-test is actually attainable. Off-screen sprites are culled at draw time.
+built once from the static level. The chain is a single unified class
+(`game/chain.ts`): the rope is a list of *spans* — frozen ones pinned between
+portals plus one active, simulated span — so simulation, portal pull-through,
+split and merge all share the same obstacle context (statics **and**
+dynamics) by construction. Fixes over the original: pull-through tightens
+frozen spans by midpoint relaxation with swept joint moves (the rope wraps
+corners and squeezables like a rope over a pulley instead of lerping straight
+through them); merging back through a portal continues from the rope's
+current shape rather than a straight line; and per-joint obstacle buckets are
+re-gathered when a tension cascade moves a joint beyond their coverage (the
+original's fast-motion clipping). Squeezables are circle colliders, so loops
+hug them roundly and the tight-loop squeeze test is attainable. Chains and
+portals draw as ground decals under the Y-sorted entities; off-screen sprites
+are culled at draw time.
+
+**Visual effects:** a WebGPU post-processing pass (`engine/post-processor.ts`,
+WGSL) runs the rendered 2D frame through bloom-lite, subtle chromatic
+aberration, colour grading, vignette and film grain; it degrades gracefully
+(no WebGPU → raw canvas) and F4 toggles it at runtime. In-world effects are a
+small particle system (`game/particles.ts`: squeeze bursts, portal sparkles,
+footstep dust) plus elliptical contact shadows under the duck and the balls.
+Tile sprites snap their destination rects to whole device pixels, which
+removes the black seam lines fractional scaling otherwise leaves between
+flush tiles.
 
 ## Development
 
