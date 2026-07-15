@@ -41,24 +41,24 @@ fn hash(p: vec2f) -> f32 {
     return fract(sin(dot(p, vec2f(12.9898, 78.233))) * 43758.5453);
 }
 
-@fragment
-fn fs(in: VsOut) -> @location(0) vec4f {
-    let uv = in.uv;
-    let px = 1.0 / u.resolution;
-    let centered = uv - vec2f(0.5);
-    let d2 = dot(centered, centered);
+fn luma(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.299, 0.587, 0.114));
+}
 
-    // Chromatic aberration: a couple of *pixels* at the far corners, zero at
-    // the centre. (Offsets are computed in texels — a UV-unit factor here
-    // reads as a full-screen anaglyph ghost.)
+// Chromatic aberration: a couple of *pixels* at the far corners, zero at the
+// centre. (Offsets are computed in texels — a UV-unit factor here reads as a
+// full-screen anaglyph ghost.)
+fn chromaticSample(uv: vec2f, centered: vec2f, d2: f32, px: vec2f) -> vec3f {
     let ca = normalize(centered + vec2f(1e-6)) * d2 * 4.0 * px * u.strength;
-    var col = vec3f(
+    return vec3f(
         textureSample(frame, samp, uv - ca).r,
         textureSample(frame, samp, uv).g,
         textureSample(frame, samp, uv + ca).b,
     );
+}
 
-    // Bloom-lite: bright neighbours bleed a soft glow (portals, rope shine).
+// Bloom-lite: bright neighbours bleed a soft glow (portals, rope shine).
+fn bloom(uv: vec2f, px: vec2f) -> vec3f {
     let t = vec3f(0.62);
     var glow = max(textureSample(frame, samp, uv + vec2f(2.0, 0.0) * px).rgb - t, vec3f(0.0));
     glow += max(textureSample(frame, samp, uv - vec2f(2.0, 0.0) * px).rgb - t, vec3f(0.0));
@@ -66,21 +66,56 @@ fn fs(in: VsOut) -> @location(0) vec4f {
     glow += max(textureSample(frame, samp, uv - vec2f(0.0, 2.0) * px).rgb - t, vec3f(0.0));
     glow += max(textureSample(frame, samp, uv + vec2f(3.0, 3.0) * px).rgb - t, vec3f(0.0));
     glow += max(textureSample(frame, samp, uv - vec2f(3.0, 3.0) * px).rgb - t, vec3f(0.0));
-    col += glow * 0.22 * u.strength;
+    return glow * 0.22 * u.strength;
+}
 
-    // Colour grade: gentle saturation, contrast and warmth.
-    let luma = dot(col, vec3f(0.299, 0.587, 0.114));
-    col = mix(vec3f(luma), col, 1.0 + 0.12 * u.strength);
+// Relief lighting: compare the brightness a couple of texels up-left against
+// down-right and tilt the pixel toward lit/shaded. Every sprite edge gets a
+// highlight on its top-left and a shade on its bottom-right — flat pixel art
+// pops out of the floor as if lit from the upper-left.
+fn relief(uv: vec2f, px: vec2f) -> f32 {
+    let above = luma(textureSample(frame, samp, uv - vec2f(1.5, 1.5) * px).rgb);
+    let below = luma(textureSample(frame, samp, uv + vec2f(1.5, 1.5) * px).rgb);
+    return clamp((above - below) * 0.5, -0.06, 0.06) * u.strength;
+}
+
+// Soft top light: the scene is brighter toward the top of the screen, like a
+// room lit from above — a cheap global depth cue.
+fn topLight(uv: vec2f) -> f32 {
+    return mix(1.0, 1.06 - 0.10 * uv.y, u.strength);
+}
+
+// Colour grade: gentle saturation, contrast and warmth.
+fn grade(c: vec3f) -> vec3f {
+    var col = mix(vec3f(luma(c)), c, 1.0 + 0.12 * u.strength);
     col = (col - 0.5) * (1.0 + 0.06 * u.strength) + 0.5;
-    col *= mix(vec3f(1.0), vec3f(1.03, 1.0, 0.97), u.strength);
+    return col * mix(vec3f(1.0), vec3f(1.03, 1.0, 0.97), u.strength);
+}
 
-    // Vignette.
+fn vignette(c: vec3f, d2: f32) -> vec3f {
     let vig = smoothstep(0.85, 0.30, sqrt(d2) * 1.15);
-    col *= mix(1.0, mix(0.72, 1.0, vig), u.strength);
+    return c * mix(1.0, mix(0.72, 1.0, vig), u.strength);
+}
 
-    // Film grain, animated.
-    let grain = hash(uv * u.resolution + fract(u.time) * 61.7) - 0.5;
-    col += grain * 0.028 * u.strength;
+// Film grain, animated.
+fn grain(uv: vec2f) -> f32 {
+    return (hash(uv * u.resolution + fract(u.time) * 61.7) - 0.5) * 0.028 * u.strength;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4f {
+    let uv = in.uv;
+    let px = 1.0 / u.resolution;
+    let centered = uv - vec2f(0.5);
+    let d2 = dot(centered, centered);
+
+    var col = chromaticSample(uv, centered, d2, px);
+    col += bloom(uv, px);
+    col += relief(uv, px);
+    col *= topLight(uv);
+    col = grade(col);
+    col = vignette(col, d2);
+    col += grain(uv);
 
     return vec4f(col, 1.0);
 }

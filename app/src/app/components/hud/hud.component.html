@@ -1,19 +1,41 @@
 <div class="hud-top">
-    <div class="stat">
-        <span class="stat-label">{{ i18n.t('squeezed_label') }}</span>
-        <span class="stat-value">{{ game.squeezed() }} / {{ game.squeezeTotal() }}</span>
+    <div class="stats">
+        <div class="stat">
+            <span class="stat-label">{{ i18n.t('squeezed_label') }}</span>
+            <span class="stat-value">{{ game.squeezed() }} / {{ game.squeezeTotal() }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">{{ i18n.t('time_label') }}</span>
+            <span class="stat-value">{{ formatDuration(game.levelTime()) }}</span>
+        </div>
+        <div class="stat fps">
+            <span class="stat-label">{{ i18n.t('fps_label') }}</span>
+            <span class="stat-value">{{ game.fps() }}</span>
+        </div>
     </div>
-    <div class="stat">
-        <span class="stat-label">{{ i18n.t('time_label') }}</span>
-        <span class="stat-value">{{ formatDuration(game.levelTime()) }}</span>
+    <div class="actions">
+        <button class="icon-btn" (click)="game.pause()" [attr.aria-label]="i18n.t('paused')">
+            <img src="assets/icons/pause.png" alt="" />
+        </button>
+        <button class="icon-btn" (click)="game.replay()" [attr.aria-label]="i18n.t('retry')">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                    d="M4 12a8 8 0 1 1 2.34 5.66"
+                    stroke="currentColor"
+                    stroke-width="2.6"
+                    stroke-linecap="round"
+                />
+                <path d="M4 20v-6h6" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+        </button>
     </div>
-    <div class="stat fps">
-        <span class="stat-label">{{ i18n.t('fps_label') }}</span>
-        <span class="stat-value">{{ game.fps() }}</span>
-    </div>
-    <button class="pause-btn" (click)="game.pause()" aria-label="Pause">
-        <img src="assets/icons/pause.png" alt="" />
-    </button>
 </div>
+
+@if (game.dragHint()) {
+    <div class="drag-hint">
+        <kbd class="keycap">E</kbd>
+        <span>{{ i18n.t('drag_hint') }}</span>
+    </div>
+}
 
 <p class="hud-bottom hint">{{ i18n.t('hud_controls') }}</p>

@@ -67,6 +67,14 @@ export interface WorldAssets {
 const CHAIN_LINK_SIZE = 4;
 /** The chain's rope colour (theme gold). */
 const CHAIN_COLOR = '#e8bd4a';
+/** Extrusion height (world px) of wall tops above the floor. */
+const WALL_LIFT = 8;
+/** Extrusion height of movable crates. */
+const BOX_LIFT = 5;
+/** How far raised tops lean away from the camera centre per world px. */
+const PARALLAX_LEAN = 0.045;
+/** Cap on the lean so far-off-screen geometry stays sane. */
+const MAX_LEAN = 14;
 
 /** Handle to a thing the player can push/pull. */
 type MovableRef = { kind: 'box'; index: number } | { kind: 'squeezable'; index: number };
@@ -191,6 +199,10 @@ export class World {
 
     readonly squeezables = new Squeezables();
     squeezeCount = 0;
+    /** True while the drag (pull) key is held this frame. */
+    private pullKeyHeld = false;
+    /** True when the player stands within drag reach of a movable. */
+    private nearMovable = false;
     private readonly particles = new Particles();
     private dustTimer = 0;
 
@@ -213,6 +225,8 @@ export class World {
     private frameScale = 1;
     private frameTx = 0;
     private frameTy = 0;
+    /** This frame's camera focus, for the extruded-geometry parallax lean. */
+    private frameCam = new Vec2();
 
     constructor(private readonly assets: WorldAssets) {
         this.level = assets.level;
@@ -320,6 +334,11 @@ export class World {
         return this.level.goal ? this.goalReached : this.allSqueezed;
     }
 
+    /** True when the HUD should show the "hold E to drag" prompt. */
+    get showDragHint(): boolean {
+        return this.nearMovable && this.player.abilities.pull;
+    }
+
     /** Reset world state for a fresh run. Reuses loaded assets and level. */
     reset(): void {
         // Rules mutate colliders/abilities live; restore the pristine level.
@@ -370,6 +389,7 @@ export class World {
         }
 
         this.player.integrateInput(input, dt);
+        this.pullKeyHeld = input.isDown('KeyE');
 
         // Portal animations; while resetting, wait for the closing anims to
         // finish before creating a fresh empty set.
@@ -644,9 +664,14 @@ export class World {
         const oldPos = this.player.pos.clone();
 
         const movables = this.movables();
-        const pull = this.player.abilities.pull
-            ? this.findPull(movables, this.player.collider(), displacement)
-            : null;
+        // Dragging is an explicit hold (E): latching on mere adjacency made
+        // walking away from any box yank it along by accident.
+        const playerRect = this.player.collider();
+        this.nearMovable = movables.some(({ rect }) => rect.grow(PULL_REACH).intersects(playerRect));
+        const pull =
+            this.player.abilities.pull && this.pullKeyHeld
+                ? this.findPull(movables, playerRect, displacement)
+                : null;
 
         this.player.pos = resolveAabb(
             this.player.pos,
@@ -934,6 +959,8 @@ export class World {
         camera.target = this.player.pos.add(new Vec2(16, 16));
         camera.offset = new Vec2(width / 2, height / 2);
         camera.zoom = this.zoom;
+        this.frameCam = camera.target;
+        this.drawParallax(ctx, width, height, camera);
         camera.apply(ctx, height);
 
         // The visible world rect (plus a margin) — everything outside is
@@ -983,9 +1010,50 @@ export class World {
     }
 
     /**
-     * Contact shadows for the duck and the squeezable balls, drawn as
-     * **pixel-art ellipses**: stacked 1px rows on the world grid (the same
-     * resolution as the sprites), one flat shade, no anti-aliasing.
+     * The deep-background starfield, drawn in **screen space** before the
+     * camera transform. Each layer is a jittered grid of dim dots scrolling
+     * at a fraction of the camera's motion — the parallax reads as depth
+     * below the playfield.
+     */
+    private drawParallax(
+        ctx: CanvasRenderingContext2D,
+        width: number,
+        height: number,
+        camera: Camera2D,
+    ): void {
+        const scale = camera.effectiveZoom(height);
+        const layers = [
+            { factor: 0.15, spacing: 110, size: 2, color: 'rgb(158 176 224 / 14%)' },
+            { factor: 0.32, spacing: 170, size: 3, color: 'rgb(158 176 224 / 22%)' },
+            { factor: 0.55, spacing: 260, size: 4, color: 'rgb(180 195 235 / 30%)' },
+        ] as const;
+        // Deterministic per-cell hash → stable star positions while scrolling.
+        const hash = (x: number, y: number) => {
+            const h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+            return h - Math.floor(h);
+        };
+        for (const layer of layers) {
+            const off = camera.target.scale(-layer.factor * scale);
+            const sp = layer.spacing;
+            const x0 = Math.floor(-off.x / sp) - 1;
+            const y0 = Math.floor(-off.y / sp) - 1;
+            ctx.fillStyle = layer.color;
+            for (let gy = y0; (gy - y0) * sp < height + 2 * sp; gy++) {
+                for (let gx = x0; (gx - x0) * sp < width + 2 * sp; gx++) {
+                    const jx = hash(gx, gy);
+                    const jy = hash(gx + 57, gy + 91);
+                    const x = Math.round(gx * sp + jx * sp * 0.8 + off.x);
+                    const y = Math.round(gy * sp + jy * sp * 0.8 + off.y);
+                    ctx.fillRect(x, y, layer.size, layer.size);
+                }
+            }
+        }
+    }
+
+    /**
+     * Contact shadows for the duck, the squeezable balls (pixel-art ellipses:
+     * stacked 1px rows on the world grid, one flat shade, no anti-aliasing)
+     * and the movable boxes — grounding every dynamic entity on the floor.
      */
     private drawShadows(ctx: CanvasRenderingContext2D): void {
         ctx.save();
@@ -994,6 +1062,9 @@ export class World {
         pixelEllipse(ctx, feet.x, feet.y + 1, 10, 3);
         for (const { center, radius } of this.squeezables.eachAlive()) {
             pixelEllipse(ctx, center.x, center.y + radius * 0.85, radius * 0.8, radius * 0.28);
+        }
+        for (const b of this.boxes) {
+            ctx.fillRect(b.rect.x + 2, b.rect.y + 3, b.rect.width, b.rect.height);
         }
         ctx.restore();
     }
@@ -1005,9 +1076,31 @@ export class World {
      * physics rects with a crate look.
      */
     private drawGeometry(ctx: CanvasRenderingContext2D, view: Rect): void {
+        // Drop-shadow pre-pass: every wall casts a short offset silhouette
+        // onto the floor. Drawn for all walls first so a shadow never falls
+        // on a neighbouring wall's lid — it reads as raised geometry.
+        ctx.save();
+        ctx.fillStyle = 'rgb(4 6 12 / 45%)';
+        for (const { tag, shape } of this.level.colliders) {
+            if (tag !== 'wall') continue;
+            const bounds = shapeBounds(shape).translate(new Vec2(3, 4));
+            if (!bounds.intersects(view)) continue;
+            if (shape.kind === 'rect') {
+                ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+            } else {
+                ctx.beginPath();
+                ctx.arc(shape.x + 3, shape.y + 4, shape.r, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+        ctx.restore();
+
         for (const collider of this.level.colliders) {
             const { tag, shape } = collider;
             if (tag === 'movable' || tag === 'item') continue; // live entities
+            // Raised geometry (walls, bars) draws in the Y-sorted pass so it
+            // occludes floor decals (rope, portals) and sorts with entities.
+            if (tag === 'wall' || tag === 'bar') continue;
             if (tag === 'plate' || tag === 'button') {
                 this.drawTrigger(ctx, collider);
                 continue;
@@ -1041,49 +1134,139 @@ export class World {
                     ctx.fillRect(shape.x, y, shape.w, 6);
                 }
                 ctx.restore();
-            } else if (tag === 'bar') {
-                // Bars read as railings: posts under a solid top rail.
-                ctx.fillStyle = 'rgb(255 138 42 / 30%)';
-                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
-                ctx.fillStyle = base;
-                if (shape.w >= shape.h) {
-                    ctx.fillRect(shape.x, shape.y, shape.w, 4);
-                    for (let x = shape.x + 4; x < shape.x + shape.w - 4; x += 16) {
-                        ctx.fillRect(x, shape.y, 4, shape.h);
-                    }
-                } else {
-                    ctx.fillRect(shape.x, shape.y, 4, shape.h);
-                    for (let y = shape.y + 4; y < shape.y + shape.h - 4; y += 16) {
-                        ctx.fillRect(shape.x, y, shape.w, 4);
-                    }
-                }
             } else {
-                // Walls: dark slab, lighter lid, faint inner border.
-                ctx.fillStyle = '#2a3040';
-                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
                 ctx.fillStyle = base;
-                ctx.fillRect(shape.x, shape.y, shape.w, Math.min(6, shape.h));
-                ctx.strokeStyle = 'rgb(255 255 255 / 6%)';
-                ctx.lineWidth = 2;
-                ctx.strokeRect(shape.x + 1, shape.y + 1, shape.w - 2, shape.h - 2);
+                ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
             }
         }
     }
 
-    /** Crate look for a movable box without linked artwork. */
-    private drawBoxFlat(ctx: CanvasRenderingContext2D, r: Rect): void {
-        ctx.fillStyle = '#8a6a2f';
-        ctx.fillRect(r.x, r.y, r.width, r.height);
-        ctx.fillStyle = '#e8bd4a';
-        ctx.fillRect(r.x + 3, r.y + 3, r.width - 6, r.height - 6);
-        ctx.strokeStyle = '#8a6a2f';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(r.x, r.y);
-        ctx.lineTo(r.right, r.bottom);
-        ctx.moveTo(r.right, r.y);
-        ctx.lineTo(r.x, r.bottom);
-        ctx.stroke();
+    /**
+     * A wall as an extruded block — bases stay put while the top faces
+     * parallax, which is what sells the height as the camera moves. Drawn in
+     * the Y-sorted raised pass, so walls occlude floor decals (rope, portals)
+     * behind them and sort correctly against the entities.
+     */
+    private drawWall(ctx: CanvasRenderingContext2D, shape: Shape): void {
+        const base = TAG_COLORS['wall'];
+        if (shape.kind === 'circle') {
+            // Extruded pillar: stacked side slices up to a leaning top.
+            const top = this.leanPoint(shape.x, shape.y, WALL_LIFT);
+            ctx.fillStyle = '#1c212e';
+            const steps = extrusionSteps(top.x - shape.x, top.y - shape.y);
+            for (let i = 0; i <= steps; i++) {
+                const t = i / steps;
+                ctx.beginPath();
+                ctx.arc(
+                    shape.x + (top.x - shape.x) * t,
+                    shape.y + (top.y - shape.y) * t,
+                    shape.r,
+                    0,
+                    Math.PI * 2,
+                );
+                ctx.fill();
+            }
+            ctx.fillStyle = base;
+            ctx.beginPath();
+            ctx.arc(top.x, top.y, shape.r, 0, Math.PI * 2);
+            ctx.fill();
+            return;
+        }
+        const footprint = new Rect(shape.x, shape.y, shape.w, shape.h);
+        this.drawExtruded(ctx, footprint, WALL_LIFT, '#1c212e', (r) => {
+            // Top face: dark slab, lighter lid, faint inner border.
+            ctx.fillStyle = '#2a3040';
+            ctx.fillRect(r.x, r.y, r.width, r.height);
+            ctx.fillStyle = base;
+            ctx.fillRect(r.x, r.y, r.width, Math.min(6, r.height));
+            ctx.strokeStyle = 'rgb(255 255 255 / 6%)';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(r.x + 1, r.y + 1, r.width - 2, r.height - 2);
+        });
+    }
+
+    /**
+     * Bars read as railings: posts under a solid top rail. Raised furniture:
+     * drawn in the Y-sorted pass so the rope (which slides underneath them
+     * physically) also renders underneath.
+     */
+    private drawBar(ctx: CanvasRenderingContext2D, shape: Shape): void {
+        if (shape.kind !== 'rect') return;
+        const base = TAG_COLORS['bar'];
+        ctx.fillStyle = 'rgb(255 138 42 / 30%)';
+        ctx.fillRect(shape.x, shape.y, shape.w, shape.h);
+        ctx.fillStyle = base;
+        if (shape.w >= shape.h) {
+            ctx.fillRect(shape.x, shape.y, shape.w, 4);
+            for (let x = shape.x + 4; x < shape.x + shape.w - 4; x += 16) {
+                ctx.fillRect(x, shape.y, 4, shape.h);
+            }
+        } else {
+            ctx.fillRect(shape.x, shape.y, 4, shape.h);
+            for (let y = shape.y + 4; y < shape.y + shape.h - 4; y += 16) {
+                ctx.fillRect(shape.x, y, shape.w, 4);
+            }
+        }
+    }
+
+    /**
+     * Project a footprint point to its raised-top position: a fixed lift plus
+     * a lean away from the camera focus, so tops parallax against their bases
+     * as the camera moves.
+     *
+     * The lean is evaluated **per point**, not per shape — two walls sharing
+     * an edge project that edge to the exact same place, so adjacent geometry
+     * can never pull apart at the seams (per-shape center offsets did).
+     */
+    private leanPoint(x: number, y: number, lift: number): Vec2 {
+        return new Vec2(
+            x + clamp((x - this.frameCam.x) * PARALLAX_LEAN, -MAX_LEAN, MAX_LEAN),
+            y + clamp((y - this.frameCam.y) * PARALLAX_LEAN, -MAX_LEAN, MAX_LEAN) - lift,
+        );
+    }
+
+    /**
+     * Draw an extruded block: dark side slices climbing from the floor
+     * footprint to a leaning top rect, then `top(topRect)` paints the face.
+     */
+    private drawExtruded(
+        ctx: CanvasRenderingContext2D,
+        rect: Rect,
+        lift: number,
+        sideColor: string,
+        top: (r: Rect) => void,
+    ): void {
+        const p0 = this.leanPoint(rect.x, rect.y, lift);
+        const p1 = this.leanPoint(rect.right, rect.bottom, lift);
+        ctx.fillStyle = sideColor;
+        const steps = extrusionSteps(p0.x - rect.x, p0.y - rect.y);
+        for (let i = 0; i <= steps; i++) {
+            const t = i / steps;
+            const x0 = rect.x + (p0.x - rect.x) * t;
+            const y0 = rect.y + (p0.y - rect.y) * t;
+            const x1 = rect.right + (p1.x - rect.right) * t;
+            const y1 = rect.bottom + (p1.y - rect.bottom) * t;
+            ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        }
+        top(new Rect(p0.x, p0.y, p1.x - p0.x, p1.y - p0.y));
+    }
+
+    /** Crate look for a movable box without linked artwork — extruded. */
+    private drawBoxFlat(ctx: CanvasRenderingContext2D, rect: Rect): void {
+        this.drawExtruded(ctx, rect, BOX_LIFT, '#5a431d', (r) => {
+            ctx.fillStyle = '#8a6a2f';
+            ctx.fillRect(r.x, r.y, r.width, r.height);
+            ctx.fillStyle = '#e8bd4a';
+            ctx.fillRect(r.x + 3, r.y + 3, r.width - 6, r.height - 6);
+            ctx.strokeStyle = '#8a6a2f';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(r.x, r.y);
+            ctx.lineTo(r.right, r.bottom);
+            ctx.moveTo(r.right, r.y);
+            ctx.lineTo(r.x, r.bottom);
+            ctx.stroke();
+        });
     }
 
     /** Pressure plates and buttons: floor decals with a live "on" state. */
@@ -1197,6 +1380,20 @@ export class World {
             if (Math.min(w, h) < playerMin) small.push(i);
             else order.push({ y: sprite.y + h, draw: () => this.drawSprite(ctx, i) });
         }
+        // Raised level geometry joins the same sort: an entity south of a
+        // wall draws over it, one behind it is occluded by the raised top.
+        for (const { tag, shape } of this.level.colliders) {
+            if (tag !== 'wall' && tag !== 'bar') continue;
+            const b = shapeBounds(shape);
+            if (!b.grow(MAX_LEAN + WALL_LIFT).intersects(view)) continue;
+            order.push({
+                y: b.bottom,
+                draw:
+                    tag === 'wall'
+                        ? () => this.drawWall(ctx, shape)
+                        : () => this.drawBar(ctx, shape),
+            });
+        }
         for (const b of this.boxes) {
             // Boxes with linked artwork are drawn by their sprites instead.
             if (b.sprites.length === 0 && b.rect.intersects(view)) {
@@ -1272,6 +1469,11 @@ export class World {
         ctx.fillStyle = 'rgba(0 228 48 / 40%)';
         ctx.fillRect(r.x, r.y, r.width, r.height);
     }
+}
+
+/** Slice count that keeps an extrusion's side solid (~2px per slice). */
+function extrusionSteps(ox: number, oy: number): number {
+    return Math.max(2, Math.ceil(Math.max(Math.abs(ox), Math.abs(oy)) / 2) + 1);
 }
 
 /**

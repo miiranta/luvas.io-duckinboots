@@ -33,6 +33,14 @@ interface Span {
     joints: Joint[];
     /** Straight-line length between the pinned ends (rope consumed fully taut). */
     fMin: number;
+    /**
+     * Rest length of the first segment (joint 0 → 1); every other segment
+     * rests at `segmentLength`. Carrying the fractional remainder of a span's
+     * rope here keeps the total rope **exact** across portal splits — rounding
+     * the remainder into whole links made the chain grow or shrink a little
+     * at every crossing.
+     */
+    restFirst: number;
 }
 
 /** Velocity retention per second for slack (un-tensioned) joints. */
@@ -114,8 +122,6 @@ export class Chain {
     private chainObstacles: Collider[] = [];
     /** Animated dash offset that makes the link pattern crawl along the rope. */
     private dashPhase = 0;
-    /** Rope freed by pull-through but not yet converted into an active joint. */
-    private pendingRope = 0;
 
     constructor(anchor: Vec2, end: Vec2, totalLength: number, linkSize: number, color: string) {
         const numSegments = Math.max(1, Math.ceil(totalLength / linkSize));
@@ -123,44 +129,40 @@ export class Chain {
         this.budget = totalLength;
         this.linkSize = linkSize;
         this.color = color;
-        this.spans = [this.straightSpan(anchor, end, numSegments + 1)];
+        this.spans = [this.straightSpan(anchor, end, totalLength)];
         this.resizeScratch();
     }
 
     // ── Span helpers ─────────────────────────────────────────────────────────
 
-    private straightSpan(a: Vec2, b: Vec2, jointCount: number): Span {
+    /**
+     * A straight span between `a` and `b` holding **exactly** `rope` length of
+     * rope: whole `segmentLength` links plus the fractional remainder carried
+     * by the first segment's rest length.
+     */
+    private straightSpan(a: Vec2, b: Vec2, rope: number): Span {
+        const s = this.segmentLength;
+        const jointCount = Math.max(2, Math.floor(rope / s + 1e-9) + 1);
         const joints: Joint[] = [];
         for (let i = 0; i < jointCount; i++) {
             const pos = a.lerp(b, i / (jointCount - 1));
             joints.push(makeJoint(pos));
         }
-        return { joints, fMin: 0 };
+        return { joints, fMin: 0, restFirst: Math.max(0, rope - (jointCount - 2) * s) };
     }
 
     private active(): Span {
         return this.spans[this.spans.length - 1];
     }
 
-    /**
-     * Joint count for a span holding `rope` length of rope.
-     *
-     * The active span is created with the rope *actually* left over at split
-     * time and **grows** via [`feedActiveSpan`] as pull-through frees rope —
-     * so the rope's total capacity never exceeds the budget, even when
-     * geometry stops a frozen span from ever reaching its straight-line
-     * minimum. (The original sized the active span off that theoretical
-     * minimum up front, which made the chain grow at every portal crossing.)
-     */
-    private jointCountForRope(rope: number): number {
-        const clamped = Math.max(rope, this.segmentLength);
-        return Math.max(2, Math.round(clamped / this.segmentLength) + 1);
+    /** Exact rope length a span holds (its capacity when pulled taut). */
+    private spanRope(span: Span): number {
+        return span.restFirst + (span.joints.length - 2) * this.segmentLength;
     }
 
-    /** Hard ceiling on active joints: every frozen span pulled fully taut. */
-    private maxActiveJointCount(): number {
-        const frozenMin = this.spans.slice(0, -1).reduce((s, span) => s + span.fMin, 0);
-        return this.jointCountForRope(this.budget - frozenMin);
+    /** Rest length of the segment between joints `i` and `i + 1` of a span. */
+    private restAt(span: Span, i: number): number {
+        return i === 0 ? span.restFirst : this.segmentLength;
     }
 
     /** Grow the scratch arrays to cover the active span's joints. */
@@ -227,7 +229,8 @@ export class Chain {
      * player end) and the rope left beyond it. Call after `update`.
      */
     tether(): { tether: Vec2; freeLength: number } {
-        const joints = this.active().joints;
+        const span = this.active();
+        const joints = span.joints;
         const n = joints.length;
         let contactIdx = 0;
         for (let i = n - 2; i >= 0; i--) {
@@ -236,10 +239,11 @@ export class Chain {
                 break;
             }
         }
-        return {
-            tether: joints[contactIdx].pos,
-            freeLength: (n - 1 - contactIdx) * this.segmentLength,
-        };
+        const free =
+            contactIdx === 0
+                ? this.spanRope(span)
+                : (n - 1 - contactIdx) * this.segmentLength;
+        return { tether: joints[contactIdx].pos, freeLength: free };
     }
 
     // ── Portal crossings ─────────────────────────────────────────────────────
@@ -258,11 +262,12 @@ export class Chain {
 
         // Rope actually left over right now: the budget minus what every
         // (now-frozen) span currently holds. `spans` has no active entry at
-        // this point, so sum them all explicitly.
+        // this point, so sum them all explicitly. Splitting while fully taut
+        // leaves zero rope: the player exits pinned to the portal mouth until
+        // pull-through frees some.
         const consumed = this.spans.reduce((s, sp) => s + Chain.spanLength(sp), 0);
-        this.pendingRope = 0;
         this.spans.push(
-            this.straightSpan(outCenter, playerPt, this.jointCountForRope(this.budget - consumed)),
+            this.straightSpan(outCenter, playerPt, Math.max(0, this.budget - consumed)),
         );
         this.resizeScratch();
         this.clearContacts();
@@ -285,7 +290,6 @@ export class Chain {
 
         const shape = reabsorbed.joints.map((j) => j.pos);
         shape.push(playerPt.clone());
-        this.pendingRope = 0;
         // Capacity for the merged span: budget minus the remaining frozen
         // spans (all entries left in `spans` right now), never less than the
         // reabsorbed shape itself.
@@ -293,10 +297,12 @@ export class Chain {
         let shapeLen = 0;
         for (let i = 1; i < shape.length; i++) shapeLen += shape[i - 1].distance(shape[i]);
         const rope = Math.max(this.budget - consumed, shapeLen);
-        const points = resamplePolyline(shape, this.jointCountForRope(rope));
+        const jointCount = Math.max(2, Math.floor(rope / this.segmentLength + 1e-9) + 1);
+        const points = resamplePolyline(shape, jointCount);
         this.spans.push({
             joints: points.map((p) => makeJoint(p)),
             fMin: 0,
+            restFirst: Math.max(0, rope - (jointCount - 2) * this.segmentLength),
         });
         this.resizeScratch();
         this.clearContacts();
@@ -461,15 +467,16 @@ export class Chain {
      */
     private constraintPass(joints: Joint[], markConstrained: boolean): number {
         const n = joints.length;
-        const sl = this.segmentLength;
-        const slSq = sl * sl;
+        const span = this.active();
         let maxMoveSq = 0;
 
         const solve = (i: number, neighbourIdx: number) => {
+            // Rest length of the segment between `i` and its neighbour.
+            const sl = this.restAt(span, Math.min(i, neighbourIdx));
             const neighbour = joints[neighbourIdx].pos;
             const delta = joints[i].pos.sub(neighbour);
             const distSq = delta.lengthSq();
-            if (distSq <= slSq) return;
+            if (distSq <= sl * sl) return;
             const dist = Math.sqrt(distSq);
             const target = neighbour.add(delta.scale(sl / dist));
             const oldPos = joints[i].pos;
@@ -544,7 +551,7 @@ export class Chain {
         const consumed = lengths.reduce((s, l) => s + l, 0);
         const active = this.active();
         const activePath = Chain.spanLength(active);
-        const capacity = (active.joints.length - 1) * this.segmentLength;
+        const capacity = this.spanRope(active);
         const slack = this.spans
             .slice(0, -1)
             .reduce((s, span, i) => s + Math.max(0, lengths[i] - span.fMin), 0);
@@ -558,29 +565,30 @@ export class Chain {
         );
         demand = Math.min(demand, slack);
 
-        for (let idx = frozenCount - 1; idx >= 0 && demand > 0.25; idx--) {
+        let freedTotal = 0;
+        for (let idx = frozenCount - 1; idx >= 0 && demand > 0.05; idx--) {
             const targetLen = Math.max(this.spans[idx].fMin, lengths[idx] - demand);
             const freed = this.tightenSpan(this.spans[idx], targetLen, staticGrid, dynamics);
             demand -= freed;
-            this.pendingRope += freed;
+            freedTotal += freed;
         }
-        this.feedActiveSpan();
+        if (freedTotal > 0) this.feedActiveSpan(freedTotal);
     }
 
     /**
-     * Convert freed rope into new active-span joints, inserted at the portal
-     * mouth (the active span's pinned start), one per `segmentLength` of rope.
-     * Capped so the active span can never exceed the all-frozen-spans-taut
-     * ceiling.
+     * Feed `rope` length of freed rope into the active span at the portal
+     * mouth: it extends the first segment's rest length, converted into whole
+     * links (new joints at the mouth) as it accumulates. Rope enters exactly
+     * as fast as the frozen side gives it up, so the total is conserved.
      */
-    private feedActiveSpan(): void {
-        const joints = this.active().joints;
-        const cap = this.maxActiveJointCount();
-        while (this.pendingRope >= this.segmentLength && joints.length < cap) {
-            this.pendingRope -= this.segmentLength;
-            const joint = makeJoint(joints[0].pos.clone());
+    private feedActiveSpan(rope: number): void {
+        const span = this.active();
+        span.restFirst += rope;
+        while (span.restFirst >= 2 * this.segmentLength) {
+            span.restFirst -= this.segmentLength;
+            const joint = makeJoint(span.joints[0].pos.clone());
             joint.heat = 1;
-            joints.splice(1, 0, joint);
+            span.joints.splice(1, 0, joint);
         }
         this.resizeScratch();
     }
@@ -611,7 +619,7 @@ export class Chain {
         }
 
         const prev = joints.map((j) => j.pos);
-        for (let iter = 0; iter < 24; iter++) {
+        for (let iter = 0; iter < 48; iter++) {
             let maxMoveSq = 0;
             for (let i = 1; i < n - 1; i++) {
                 const mid = joints[i - 1].pos.add(joints[i + 1].pos).scale(0.5);
@@ -624,12 +632,39 @@ export class Chain {
                 joints[i].pos = moved;
                 joints[i].oldPos = moved.clone();
             }
-            if (Chain.spanLength(span) <= targetLen || maxMoveSq < 1e-4) break;
+            if (Chain.spanLength(span) <= targetLen || maxMoveSq < 1e-6) break;
         }
         // Rope being pulled through re-heats the cells that gave way.
         for (let i = 0; i < n; i++) {
             const moved = joints[i].pos.distance(prev[i]);
             joints[i].heat = Math.max(joints[i].heat, Math.min(1, moved * 0.5));
+        }
+
+        // Midpoint relaxation stalls on bunched joints (their neighbours sit
+        // on top of them, so the midpoint pull vanishes long before taut).
+        // Resampling the span uniformly along its own polyline restores an
+        // even spacing — the new points lie on the existing collision-free
+        // path — which keeps the next frame's tightening effective. Any path
+        // length lost to chord-cutting is counted as freed rope, so the total
+        // stays conserved. Shed joints the shortened span no longer needs.
+        const midLen = Chain.spanLength(span);
+        if (before - midLen > 0.05) {
+            const count = Math.max(2, Math.round(midLen / this.segmentLength) + 1);
+            const heats = joints.map((j) => j.heat);
+            const points = resamplePolyline(
+                joints.map((j) => j.pos),
+                count,
+            );
+            span.joints = points.map((p, i) => {
+                const joint = makeJoint(pushPointOutOf(p, obstacles, ROPE_RADIUS));
+                joint.heat = heats[Math.round((i * (n - 1)) / (count - 1))] ?? 0;
+                return joint;
+            });
+            // Keep the pinned endpoints exact.
+            span.joints[0].pos = joints[0].pos;
+            span.joints[0].oldPos = joints[0].pos.clone();
+            span.joints[count - 1].pos = joints[n - 1].pos;
+            span.joints[count - 1].oldPos = joints[n - 1].pos.clone();
         }
         return before - Chain.spanLength(span);
     }

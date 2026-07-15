@@ -42,6 +42,8 @@ export class GameService {
     readonly fps = signal(0);
     /** Seconds spent in the current run (HUD timer / win screen). */
     readonly levelTime = signal(0);
+    /** True while the player is close enough to a movable to drag it. */
+    readonly dragHint = signal(false);
     /** User toggle for the shader effects (F4). */
     readonly shadersEnabled = signal(true);
     /** Whether WebGPU post-processing is available on this device. */
@@ -62,7 +64,6 @@ export class GameService {
     private canvas?: HTMLCanvasElement;
     private ctx?: CanvasRenderingContext2D;
     private post: PostProcessor | null = null;
-    private elapsed = 0;
     private transitioning = false;
     /** Where leaving the pause/end screens returns to (menu or editor). */
     private returnTo: 'menu' | 'editor' = 'menu';
@@ -189,9 +190,14 @@ export class GameService {
                 }
                 if (this.input.wasPressed('KeyF')) this.toggleFullscreen();
                 if (this.input.wasPressed('F4')) this.shadersEnabled.update((v) => !v);
+                if (this.input.wasPressed('KeyR')) {
+                    this.replay();
+                    break;
+                }
                 world.update(this.input, dt);
                 this.squeezed.set(world.squeezeCount);
                 this.levelTime.set(world.levelTime);
+                this.dragHint.set(world.showDragHint);
                 this.fps.set(this.loop?.fps ?? 0);
 
                 // Win by the level's objective: reach the goal zone when one
@@ -238,9 +244,11 @@ export class GameService {
         if (!inWorld || !world) return;
 
         world.draw(ctx, w, h);
-        this.elapsed += 1 / 60;
         if (this.shadersActive() && this.post) {
-            this.post.render(canvas, this.elapsed, 1);
+            // Real elapsed time: render runs per display frame, not per fixed
+            // step, so counting 1/60 per call ran the shader clock fast on
+            // high-refresh displays.
+            this.post.render(canvas, performance.now() / 1000, 1);
         }
     }
 

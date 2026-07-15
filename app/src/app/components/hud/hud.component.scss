@@ -10,13 +10,23 @@
     inset-inline-start: 1rem;
     inset-inline-end: 1rem;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
+    justify-content: space-between;
     gap: 0.8rem;
+}
+
+// Stats stack vertically in the corner, aligned into one tidy column.
+.stats {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    min-width: 11rem;
 }
 
 .stat {
     display: flex;
     align-items: baseline;
+    justify-content: space-between;
     gap: 0.55rem;
     padding: 0.45rem 0.9rem;
     background: var(--panel);
@@ -39,9 +49,13 @@
     color: var(--text-normal);
 }
 
-.pause-btn {
+.actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.icon-btn {
     pointer-events: auto;
-    margin-inline-start: auto;
     width: 2.6rem;
     height: 2.6rem;
     display: grid;
@@ -50,6 +64,7 @@
     border: 1px solid var(--panel-border);
     border-radius: 8px;
     cursor: pointer;
+    color: var(--text-normal);
     transition: border-color 0.15s ease;
 
     img {
@@ -59,12 +74,82 @@
         opacity: 0.75;
     }
 
+    svg {
+        width: 18px;
+        height: 18px;
+        opacity: 0.75;
+    }
+
     &:hover {
         border-color: var(--gold);
 
-        img {
+        img,
+        svg {
             opacity: 1;
         }
+    }
+}
+
+// "Hold E to drag" prompt: floats above the controls hint, keycap styled
+// like a physical key.
+.drag-hint {
+    position: absolute;
+    bottom: 3.2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.95rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    color: var(--text-normal);
+    font-size: 0.8rem;
+    letter-spacing: 0.12em;
+    animation: hint-rise 0.25s ease-out;
+}
+
+.keycap {
+    display: grid;
+    place-items: center;
+    min-width: 1.7rem;
+    height: 1.7rem;
+    padding: 0 0.4rem;
+    font: inherit;
+    font-size: 0.95rem;
+    color: var(--gold-bright);
+    background: linear-gradient(rgb(255 255 255 / 10%), rgb(0 0 0 / 25%));
+    border: 1px solid var(--gold);
+    border-bottom-width: 3px;
+    border-radius: 6px;
+    animation: keycap-tap 1.6s ease-in-out infinite;
+}
+
+@keyframes hint-rise {
+    from {
+        opacity: 0;
+        transform: translate(-50%, 0.4rem);
+    }
+
+    to {
+        opacity: 1;
+        transform: translate(-50%, 0);
+    }
+}
+
+@keyframes keycap-tap {
+    0%,
+    72%,
+    100% {
+        transform: translateY(0);
+        border-bottom-width: 3px;
+    }
+
+    80%,
+    92% {
+        transform: translateY(2px);
+        border-bottom-width: 1px;
     }
 }
 
